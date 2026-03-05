@@ -522,7 +522,6 @@ if st.session_state['confirmado']:
                 df_auth = pd.read_excel(auth_file)
                 auth_dict = {str(row.iloc[0]).strip(): str(row.iloc[5]).strip().upper() for idx, row in df_auth.iterrows() if len(str(row.iloc[0]).strip()) == 44}
                 
-                # Atualizar relatório com base no Excel
                 div_list = []
                 for item in st.session_state['relatorio']:
                     if item["Chave"] in auth_dict and "CANCEL" in auth_dict[item["Chave"]]:
@@ -579,7 +578,13 @@ if st.session_state['confirmado']:
 
         if st.button("🚀 PROCESSAR E GERAR ARQUIVOS FINAIS"):
             with st.spinner("Buscando no HD e montando pacotes..."):
-                limpar_arquivos_temp() # Limpa zips antigos
+                
+                # CORREÇÃO APLICADA AQUI: Limpa apenas os zips finais antigos para não apagar os uploads!
+                for f in os.listdir('.'):
+                    if f.startswith('z_org_final') or f.startswith('z_todos_final'):
+                        try: os.remove(f)
+                        except: pass
+                
                 os.makedirs(TEMP_EXTRACT_DIR, exist_ok=True)
                 
                 # --- EXCEL ---
