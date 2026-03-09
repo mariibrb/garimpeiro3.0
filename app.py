@@ -295,7 +295,7 @@ def limpar_arquivos_temp():
     except: 
         pass
 
-# --- DIVISOR DE LOTES HTML ---
+# --- DIVISOR DE LOTES HTML (Para deixar botões organizados) ---
 def chunk_list(lst, n):
     for i in range(0, len(lst), n): 
         yield lst[i:i + n]
@@ -307,7 +307,7 @@ def extrair_notas_faltantes_dominio(pdf_file):
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
-                # Padrão flexível para capturar o layout do PDF da Domínio (Inicial Final Série Espécie)
+                # Padrão para capturar números de notas no relatório da Domínio
                 matches = re.findall(r'(\d+)\s+(\d+)\s+(\d+)\s+(?:NFe|NFCe|CTe|NF-e|NFC-e|CT-e)', text, re.IGNORECASE)
                 for m in matches:
                     inicio, fim, serie = int(m[0]), int(m[1]), str(m[2])
@@ -1145,7 +1145,7 @@ if st.session_state['confirmado']:
         anos_meses = sorted(list(set([f"{r.get('Ano', '0000')}/{r.get('Mes', '00')}" for r in st.session_state['relatorio'] if r.get('Ano', '0000') != '0000'])))
         modelos = sorted(list(set([r.get('Tipo', '') for r in st.session_state['relatorio']])))
         series = sorted(list(set([str(r.get('Série', '0')) for r in st.session_state['relatorio']])))
-        status_opcoes = sorted(list(set([r.get('Status', '') for r in st.session_state['relatorio']]))) # <-- Novo filtro de status
+        status_opcoes = sorted(list(set([r.get('Status', '') for r in st.session_state['relatorio']]))) 
         
         with st.container():
             f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns(5)
@@ -1159,7 +1159,7 @@ if st.session_state['confirmado']:
             with f_col4:
                 filtro_series = st.multiselect("🔢 Série:", series)
             with f_col5:
-                filtro_status = st.multiselect("✅ Status:", status_opcoes) # <-- Campo do Status
+                filtro_status = st.multiselect("✅ Status:", status_opcoes) 
 
         if st.button("🚀 PROCESSAR E GERAR ARQUIVOS FINAIS"):
             
@@ -1191,7 +1191,7 @@ if st.session_state['confirmado']:
                     if len(filtro_series) > 0:
                         df_geral_filtrado = df_geral_filtrado[df_geral_filtrado['Série'].astype(str).isin(filtro_series)]
 
-                    if len(filtro_status) > 0: # <-- Lógica do Status
+                    if len(filtro_status) > 0: 
                         df_geral_filtrado = df_geral_filtrado[df_geral_filtrado['Status Final'].isin(filtro_status)]
 
                 # Excel Master
@@ -1255,48 +1255,45 @@ if st.session_state['confirmado']:
             limpar_arquivos_temp(); st.session_state.clear(); st.rerun()
 
         # =====================================================================
-        # BLOCO FINAL: CRUZAMENTO FALTANTES DOMÍNIO (Mantendo 100% íntegro)
+        # BLOCO FINAL: CRUZAMENTO FALTANTES DOMÍNIO (COM ESTRUTURA DE PASTAS)
         # =====================================================================
         st.divider()
         st.markdown("### 🔎 CRUZAMENTO FALTANTES DOMÍNIO SISTEMAS")
-        with st.expander("Suba o relatório da Domínio para baixar os XMLs que estão no lote mas não no sistema"):
-            pdf_dominio = st.file_uploader("Relatório (PDF):", type=["pdf"], key="pdf_dom")
+        with st.expander("Suba o relatório da Domínio para baixar os XMLs organizados por pastas"):
+            pdf_dominio = st.file_uploader("Relatório de notas não lançadas (PDF):", type=["pdf"], key="pdf_dom")
             if pdf_dominio and st.button("🔎 BUSCAR XMLS NO LOTE"):
                 notas_pdf = extrair_notas_faltantes_dominio(pdf_dominio)
                 if notas_pdf:
                     ch_encontradas = []
                     df_base = st.session_state['df_geral']
                     for n in notas_pdf:
-                        # Busca no lote lido se temos esse XML para entregar
-                        filtro = df_base[(df_base['Série'].astype(str) == n['Série']) & (df_base['Nota'] == n['Número']) & (df_base['Status Final'] == 'NORMAIS')]
-                        if not filtro.empty: 
-                            ch_encontradas.append(filtro.iloc[0]['Chave'])
+                        f = df_base[(df_base['Série'].astype(str) == n['Série']) & (df_base['Nota'] == n['Número']) & (df_base['Status Final'] == 'NORMAIS')]
+                        if not f.empty: ch_encontradas.append(f.iloc[0]['Chave'])
                     st.session_state['ch_falt_dom'] = ch_encontradas
-                    if ch_encontradas: 
-                        st.success(f"Encontrados {len(ch_encontradas)} XMLs correspondentes!")
-                    else:
-                        st.warning("Nenhum XML do lote corresponde às notas do PDF.")
-
+                    if ch_encontradas: st.success(f"Encontrados {len(ch_encontradas)} XMLs correspondentes!")
+                    else: st.warning("Nenhum XML do lote corresponde às notas do PDF.")
+            
             if st.session_state.get('ch_falt_dom'):
                 z_dom_io = io.BytesIO()
                 ch_set = set(st.session_state['ch_falt_dom'])
                 with zipfile.ZipFile(z_dom_io, "w", zipfile.ZIP_DEFLATED) as zf:
                     for fn in os.listdir(TEMP_UPLOADS_DIR):
-                        with open(os.path.join(TEMP_UPLOADS_DIR, fn), "rb") as ft:
+                        f_path = os.path.join(TEMP_UPLOADS_DIR, fn)
+                        with open(f_path, "rb") as ft:
                             for name, data in extrair_recursivo(ft, fn):
                                 res, _ = identify_xml_info(data, cnpj_limpo, name)
                                 if res and res["Chave"] in ch_set: 
-                                    zf.writestr(name, data)
+                                    # O PONTO CHAVE: Gravar com a estrutura de pastas fiscal (Pasta/Nome)
+                                    zf.writestr(f"{res['Pasta']}/{name}", data)
                 
-                # Ajuste para garantir que o download funcione reajustando o ponteiro
                 z_dom_io.seek(0)
                 
                 st.download_button(
-                    label="📥 BAIXAR XMLS PARA ESCRITURAÇÃO (ZIP)",
-                    data=z_dom_io.getvalue(), # .getvalue() garante o envio do conteúdo completo
-                    file_name="faltantes_dominio.zip",
+                    label="📥 BAIXAR FALTANTES ORGANIZADOS (ZIP)",
+                    data=z_dom_io.getvalue(), 
+                    file_name="faltantes_dominio_organizados.zip",
                     mime="application/zip",
-                    key="btn_download_dominio_final",
+                    key="btn_download_dominio_org",
                     use_container_width=True
                 )
 else:
