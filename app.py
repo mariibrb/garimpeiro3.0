@@ -7,7 +7,7 @@ import pandas as pd
 import random
 import gc
 import shutil
-import pdfplumber  # Adicionado para ler o relatório da domínio
+import pdfplumber
 
 # --- CONFIGURAÇÃO E ESTILO (CLONE ABSOLUTO DO DIAMOND TAX) ---
 st.set_page_config(page_title="GARIMPEIRO", layout="wide", page_icon="⛏️")
@@ -300,22 +300,19 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n): 
         yield lst[i:i + n]
 
-# --- FUNÇÃO PARA EXTRAIR NOTAS DO PDF DA DOMÍNIO ---
+# --- FUNÇÃO AUXILIAR PARA O BLOCO DOMÍNIO ---
 def extrair_notas_faltantes_dominio(pdf_file):
     notas_faltantes = []
     try:
         with pdfplumber.open(pdf_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
-                # Procura padrões de numeração no relatório da Domínio
-                # Exemplo: 284631 284631 2 NFe
-                matches = re.findall(r'(\d+)\s+(\d+)\s+(\d+)\s+(?:NFe|NFCe|CTe)', text)
+                matches = re.findall(r'(\d+)\s+(\d+)\s+(\d+)\s+(?:NFe|NFCe|CTe|NF-e|NFC-e|CT-e)', text, re.IGNORECASE)
                 for m in matches:
                     inicio, fim, serie = int(m[0]), int(m[1]), str(m[2])
                     for num in range(inicio, fim + 1):
                         notas_faltantes.append({"Série": serie, "Número": num})
-    except:
-        pass
+    except: pass
     return notas_faltantes
 
 # --- INTERFACE ---
@@ -367,19 +364,17 @@ keys_to_init = [
     'export_ready',
     'org_zip_parts',
     'todos_zip_parts',
-    'chaves_faltantes_dominio' # Nova chave para o módulo Domínio
+    'ch_falt_dom'
 ]
 
 for k in keys_to_init:
     if k not in st.session_state:
         if 'df' in k: 
             st.session_state[k] = pd.DataFrame()
-        elif k == 'relatorio' or k == 'chaves_faltantes_dominio': 
+        elif k in ['relatorio', 'org_zip_parts', 'todos_zip_parts', 'ch_falt_dom']: 
             st.session_state[k] = []
         elif k == 'st_counts': 
             st.session_state[k] = {"CANCELADOS": 0, "INUTILIZADOS": 0, "AUTORIZADAS": 0}
-        elif 'parts' in k:
-            st.session_state[k] = []
         else: 
             st.session_state[k] = False
 
@@ -590,45 +585,6 @@ if st.session_state['confirmado']:
                 st.dataframe(st.session_state['df_inutilizadas'], use_container_width=True, hide_index=True)
             else: 
                 st.info("ℹ️ Nenhuma nota.")
-
-        st.divider()
-
-        # =====================================================================
-        # MÓDULO NOVO: BAIXAR FALTANTES DOMÍNIO
-        # =====================================================================
-        st.markdown("### 🔎 ETAPA: CRUZAR COM RELATÓRIO DOMÍNIO SISTEMAS")
-        with st.expander("Clique aqui para subir o PDF da Domínio (Notas não lançadas) e baixar apenas esses XMLs"):
-            relatorio_pdf = st.file_uploader("Suba o relatório de notas não lançadas em PDF:", type=["pdf"], key="dominio_pdf")
-            if relatorio_pdf and st.button("🔎 BUSCAR XMLS FALTANTES NO SISTEMA"):
-                notas_pdf = extrair_notas_faltantes_dominio(relatorio_pdf)
-                if notas_pdf:
-                    chaves_encontradas = []
-                    df_base = st.session_state['df_geral']
-                    for n_pdf in notas_pdf:
-                        # Busca no banco de dados lido se temos esse XML disponível
-                        filtro = df_base[(df_base['Série'].astype(str) == n_pdf['Série']) & (df_base['Nota'] == n_pdf['Número']) & (df_base['Status Final'] == 'NORMAIS')]
-                        if not filtro.empty:
-                            chaves_encontradas.append(filtro.iloc[0]['Chave'])
-                    
-                    st.session_state['chaves_faltantes_dominio'] = chaves_encontradas
-                    st.success(f"Encontramos {len(chaves_encontradas)} XMLs no seu lote que constam como não lançados na Domínio!")
-                else:
-                    st.warning("Nenhuma nota identificada no padrão do PDF.")
-
-            if st.session_state.get('chaves_faltantes_dominio'):
-                if st.button("📥 BAIXAR PACOTE PARA ESCRITURAÇÃO (ZIP)"):
-                    chaves_alvo = set(st.session_state['chaves_faltantes_dominio'])
-                    zip_faltantes = io.BytesIO()
-                    with zipfile.ZipFile(zip_faltantes, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for f_name in os.listdir(TEMP_UPLOADS_DIR):
-                            f_path = os.path.join(TEMP_UPLOADS_DIR, f_name)
-                            with open(f_path, "rb") as f_temp:
-                                for name, xml_data in extrair_recursivo(f_temp, f_name):
-                                    res, _ = identify_xml_info(xml_data, cnpj_limpo, name)
-                                    if res and res["Chave"] in chaves_alvo:
-                                        zf.writestr(name, xml_data)
-                    
-                    st.download_button("📥 DOWNLOAD XMLS FALTANTES", zip_faltantes.getvalue(), "faltantes_dominio.zip", use_container_width=True)
 
         st.divider()
 
@@ -1296,5 +1252,37 @@ if st.session_state['confirmado']:
 
         if st.button("⛏️ NOVO GARIMPO / LIMPAR TUDO"):
             limpar_arquivos_temp(); st.session_state.clear(); st.rerun()
+
+        # =====================================================================
+        # NOVO BLOCO: ADICIONADO AO FIM (CONFORME SOLICITADO)
+        # =====================================================================
+        st.divider()
+        st.markdown("### 🔎 CRUZAMENTO FALTANTES DOMÍNIO SISTEMAS")
+        with st.expander("Suba o relatório da Domínio para baixar os XMLs que estão no lote mas não no sistema"):
+            pdf_dominio = st.file_uploader("Relatório de notas não lançadas (PDF):", type=["pdf"], key="pdf_dom")
+            if pdf_dominio and st.button("🔎 BUSCAR XMLS NO LOTE"):
+                notas_pdf = extrair_notas_faltantes_dominio(pdf_dominio)
+                if notas_pdf:
+                    ch_encontradas = []
+                    df_base = st.session_state['df_geral']
+                    for n in notas_pdf:
+                        f = df_base[(df_base['Série'].astype(str) == n['Série']) & (df_base['Nota'] == n['Número']) & (df_base['Status Final'] == 'NORMAIS')]
+                        if not f.empty: ch_encontradas.append(f.iloc[0]['Chave'])
+                    st.session_state['ch_falt_dom'] = ch_encontradas
+                    if ch_encontradas: st.success(f"Foram encontrados {len(ch_encontradas)} XMLs correspondentes!")
+                    else: st.warning("Nenhum XML do lote corresponde às notas do PDF.")
+            
+            if st.session_state.get('ch_falt_dom'):
+                if st.button("📥 BAIXAR XMLS PARA ESCRITURAÇÃO (ZIP)"):
+                    z_dom = io.BytesIO()
+                    ch_set = set(st.session_state['ch_falt_dom'])
+                    with zipfile.ZipFile(z_dom, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fn in os.listdir(TEMP_UPLOADS_DIR):
+                            with open(os.path.join(TEMP_UPLOADS_DIR, fn), "rb") as ft:
+                                for name, data in extrair_recursivo(ft, fn):
+                                    res, _ = identify_xml_info(data, cnpj_limpo, name)
+                                    if res and res["Chave"] in ch_set: zf.writestr(name, data)
+                    st.download_button("📥 DOWNLOAD FALTANTES", z_dom.getvalue(), "faltantes_dominio.zip", use_container_width=True)
+
 else:
     st.warning("👈 Insira o CNPJ lateral para começar.")
