@@ -1,0 +1,11 @@
+[server]
+# Limite de upload no browser (MB). 2048 ≈ 2 GB.
+# Atenção: o corpo do upload ainda é tratado em memória no servidor (Tornado). Vários GB de uma vez
+# podem dar MemoryError ao receber — erro 500 / «Invalid multipart» — mesmo com maxUploadSize alto.
+maxUploadSize = 2048
+
+[theme]
+primaryColor = "#FF69B4"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FFDEEF"
+textColor = "#262730"
