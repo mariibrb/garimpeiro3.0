@@ -5198,6 +5198,7 @@ def _garimpo_aplicar_planilhas_inutil_cancel_no_relatorio(
     rel_list: list,
     cnpj_limpo: str,
     df_faltantes: pd.DataFrame,
+    df_resumo: pd.DataFrame,
     up_inut,
     up_canc,
     texto_inut_colar=None,
@@ -5208,7 +5209,8 @@ def _garimpo_aplicar_planilhas_inutil_cancel_no_relatorio(
     Opcionalmente aceita **texto colado** da grelha Sefaz / Excel (como no painel após a análise).
     """
     out = {"inut": 0, "canc": 0, "msgs": []}
-    bur = conjunto_triplas_buracos(df_faltantes)
+    df_faltantes_util = filtrar_df_faltantes_entre_xml_lidos(df_faltantes, df_resumo)
+    bur = conjunto_triplas_buracos(df_faltantes_util)
 
     def _merge_uploads(up, label):
         if up is None:
@@ -5644,6 +5646,61 @@ def conjunto_triplas_buracos(df_faltantes):
         except (TypeError, ValueError):
             continue
     return out
+
+
+def filtrar_df_faltantes_entre_xml_lidos(df_faltantes: pd.DataFrame, df_resumo: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mantém só buracos cuja nota fique entre Início/Fim já lidos nos XML (por Tipo/Série).
+    Evita "buracos gigantes" artificiais ao aplicar inutilizadas/canceladas manuais.
+    """
+    if df_faltantes is None or df_faltantes.empty:
+        return pd.DataFrame(columns=getattr(df_faltantes, "columns", []))
+    if df_resumo is None or df_resumo.empty:
+        return df_faltantes.copy()
+
+    d = df_faltantes.copy()
+    r = df_resumo.copy()
+
+    if "Serie" in d.columns and "Série" not in d.columns:
+        d = d.rename(columns={"Serie": "Série"})
+    if "Serie" in r.columns and "Série" not in r.columns:
+        r = r.rename(columns={"Serie": "Série"})
+    if "Tipo" not in d.columns and "Documento" in d.columns:
+        d = d.rename(columns={"Documento": "Tipo"})
+    if "Documento" not in r.columns and "Tipo" in r.columns:
+        r = r.rename(columns={"Tipo": "Documento"})
+
+    if not {"Tipo", "Série", "Num_Faltante"}.issubset(d.columns):
+        return df_faltantes.copy()
+    if not {"Documento", "Série", "Início", "Fim"}.issubset(r.columns):
+        return df_faltantes.copy()
+
+    faixa = {}
+    for _, rr in r.iterrows():
+        try:
+            k = (str(rr["Documento"]).strip(), str(rr["Série"]).strip())
+            ini = int(rr["Início"])
+            fim = int(rr["Fim"])
+            if ini > fim:
+                ini, fim = fim, ini
+            faixa[k] = (ini, fim)
+        except (TypeError, ValueError):
+            continue
+
+    out_rows = []
+    for _, row in d.iterrows():
+        try:
+            k = (str(row["Tipo"]).strip(), str(row["Série"]).strip())
+            n = int(row["Num_Faltante"])
+        except (TypeError, ValueError):
+            continue
+        lim = faixa.get(k)
+        if lim is None:
+            continue
+        if lim[0] <= n <= lim[1]:
+            out_rows.append(row.to_dict())
+
+    return pd.DataFrame(out_rows, columns=d.columns) if out_rows else d.iloc[0:0].copy()
 
 
 def _dataframe_modelo_planilha_inutil_sem_xml():
@@ -6380,7 +6437,10 @@ def processar_painel_lateral_direito(
         if _err_tr:
             err_p = _err_tr
         else:
-            _df_bu = st.session_state["df_faltantes"].copy()
+            _df_bu = filtrar_df_faltantes_entre_xml_lidos(
+                st.session_state["df_faltantes"].copy(),
+                st.session_state.get("df_resumo"),
+            )
             _bur_t = conjunto_triplas_buracos(_df_bu)
             if not _bur_t:
                 err_p = "Não há buracos na auditoria — nada importado da planilha/texto."
@@ -6422,7 +6482,10 @@ def processar_painel_lateral_direito(
     _MAX_FAIXA_INUT = 5000
     n_f = 0
     err_f = None
-    df_fb = st.session_state["df_faltantes"].copy()
+    df_fb = filtrar_df_faltantes_entre_xml_lidos(
+        st.session_state["df_faltantes"].copy(),
+        st.session_state.get("df_resumo"),
+    )
     if not df_fb.empty and "Serie" in df_fb.columns and "Série" not in df_fb.columns:
         df_fb = df_fb.rename(columns={"Serie": "Série"})
     _bur_f = set()
@@ -6502,7 +6565,10 @@ def processar_painel_lateral_direito(
         if _err_trc:
             err_p_c = _err_trc
         else:
-            _df_buc = st.session_state["df_faltantes"].copy()
+            _df_buc = filtrar_df_faltantes_entre_xml_lidos(
+                st.session_state["df_faltantes"].copy(),
+                st.session_state.get("df_resumo"),
+            )
             _bur_tc = conjunto_triplas_buracos(_df_buc)
             if not _bur_tc:
                 err_p_c = "Canceladas — não há buracos na auditoria — nada importado da planilha/texto."
@@ -6543,7 +6609,10 @@ def processar_painel_lateral_direito(
     _MAX_FAIXA_CANC = 5000
     n_f_c = 0
     err_f_c = None
-    df_fbc = st.session_state["df_faltantes"].copy()
+    df_fbc = filtrar_df_faltantes_entre_xml_lidos(
+        st.session_state["df_faltantes"].copy(),
+        st.session_state.get("df_resumo"),
+    )
     if not df_fbc.empty and "Serie" in df_fbc.columns and "Série" not in df_fbc.columns:
         df_fbc = df_fbc.rename(columns={"Serie": "Série"})
     _bur_fc = set()
@@ -10564,7 +10633,8 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
         if _btn_pc:
             st.markdown("##### Pasta no PC — Excel + ZIPs")
             st.caption(
-                "Se já definiu a pasta no **passo 3** (pasta destino), o caminho aparece aqui; pode alterar antes de gravar."
+                "Se definiu pasta no **passo 3**, o caminho aparece aqui e pode ser alterado. "
+                "Se não definiu, deixe vazio e escolha depois."
             )
             st.text_input(
                 "Pasta onde gravar tudo (caminho completo — cole do Explorador)",
@@ -10745,9 +10815,7 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                 unsafe_allow_html=True,
             )
             st.caption(
-                "A **zona de anexos** está logo abaixo (vários XML/ZIP). "
-                "Um **único envio** com **muitos MB ou GB** pode falhar no **servidor** com **500** ou «Invalid multipart» — o Streamlit/Tornado carrega o multipart **todo na RAM** ao receber; **não** é falha do garimpo a ler XML. "
-                "Para lotes enormes: **vários anexos** em partes menores **ou** **pasta no servidor** (campo em baixo, quando existir)."
+                "A zona de anexos está logo abaixo (vários XML/ZIP)"
             )
             _garimpo_liberta_upload_lote_xml_se_pesado()
             try:
@@ -10883,10 +10951,7 @@ O que esperar de cada modelo:
                     unsafe_allow_html=True,
                 )
                 st.caption(
-                    "Cole a pasta **antes** de **Iniciar grande garimpo** (só **seu** PC ou servidor — **não** Cloud). "
-                    "Grava **Garimpeiro_Local_…** (XML, Excel, ZIP) **depois** do relatório na tela. **Vazio** = só ver aqui; **mesmo** sítio para **contabilidade**. "
-                    "**SPED** em cima muda o nome da pasta e pode acrescentar um Excel. Alterou ficheiros? **Atualizar arquivos salvos na pasta**. "
-                    "ZIP mais apertado: variável **GARIMPEIRO_ZIP_COMPRESSLEVEL** **1**–**9** (sem mexer = **6**)."
+                    "Cole a pasta antes de Iniciar grande garimpo."
                 )
                 st.text_input(
                     "Pasta de destino",
@@ -10899,10 +10964,6 @@ O que esperar de cada modelo:
                     key="mariana_zip_basename",
                     placeholder="Opcional — ex.: Cliente ou projeto",
                     help="Prefixo sanitizado dos ficheiros .zip do pacote contabilidade.",
-                )
-                st.caption(
-                    "**Só** interessa se for **gravar** na pasta (ou ZIP da contabilidade no disco). "
-                    "Se a pasta ficar **vazia**, pode **ignorar** — **ler** o lote é **igual** em todos os modos."
                 )
                 _h_layout = (
                     "**Aberto** = pastas com XML no espelho **e** `.zip` do pacote. **ZIP** = só `.zip` e Excel (sem pastas de XML). "
@@ -10927,19 +10988,25 @@ O que esperar de cada modelo:
                         "dom_zip": "Simplificado ZIP",
                     }.get(str(c or ""), "Arquivo aberto")
 
-                st.selectbox(
-                    "**Como gravar na pasta de rede** (se definiu o caminho acima)",
-                    options=tuple(x[0] for x in _garimpo_extracao_modo_quatro_codigos()),
-                    key=SESSION_KEY_GARIMPO_EXTRACAO_MODO_QUATRO,
-                    format_func=_fmt_modo_quatro,
-                    help=_h_layout,
-                )
-                _garimpo_extracao_aplicar_modo_quatro(
-                    str(st.session_state.get(SESSION_KEY_GARIMPO_EXTRACAO_MODO_QUATRO) or "rec_aberto")
-                )
-                st.caption(
-                    "Resumo em tabela (Arquivo vs Simplificado; pastas **e** ZIP): expander **Detalhes de cada Modelo de extração**."
-                )
+                _tem_pasta_destino = bool(str(st.session_state.get("mariana_zip_save_dir") or "").strip())
+                if _tem_pasta_destino:
+                    st.selectbox(
+                        "**Como gravar na pasta de rede**",
+                        options=tuple(x[0] for x in _garimpo_extracao_modo_quatro_codigos()),
+                        key=SESSION_KEY_GARIMPO_EXTRACAO_MODO_QUATRO,
+                        format_func=_fmt_modo_quatro,
+                        help=_h_layout,
+                    )
+                    _garimpo_extracao_aplicar_modo_quatro(
+                        str(st.session_state.get(SESSION_KEY_GARIMPO_EXTRACAO_MODO_QUATRO) or "rec_aberto")
+                    )
+                    st.caption(
+                        "Resumo em tabela (Arquivo vs Simplificado; pastas **e** ZIP): expander **Detalhes de cada Modelo de extração**."
+                    )
+                else:
+                    st.caption(
+                        "Modelo de gravação: **decidir depois**. Defina a pasta acima para liberar essa escolha."
+                    )
                 with st.expander("Detalhes de cada Modelo de extração", expanded=False):
                     st.markdown(_extracao_lote_expander_md)
             # Community Cloud: PASSO 3 oculto; ZIP e pastas ficam em «matriosca» (definição acima se a chave ainda não existir).
@@ -11340,6 +11407,7 @@ O que esperar de cada modelo:
                         rel_list,
                         cnpj_limpo,
                         pd.DataFrame(fal_final),
+                        pd.DataFrame(res_final),
                         _u_inut,
                         _u_canc,
                         texto_inut_colar=_txt_inut_ini or None,
@@ -11911,14 +11979,27 @@ O que esperar de cada modelo:
                         unsafe_allow_html=True,
                     )
                     with st.expander("\u2795 Incluir mais ficheiros no lote (sem resetar)", expanded=False):
+                        if "_extra_files_uploader_rev" not in st.session_state:
+                            st.session_state["_extra_files_uploader_rev"] = 0
+                        _extra_rev = int(st.session_state.get("_extra_files_uploader_rev", 0))
+                        _extra_key = f"extra_files_{_extra_rev}"
                         extra_files = st.file_uploader(
-                            "Escolha os XML ou ZIP a acrescentar ao lote atual:",
-                            accept_multiple_files=True,
-                            key="extra_files",
+                            "Escolha 1 XML ou ZIP por vez para acrescentar ao lote atual:",
+                            accept_multiple_files=False,
+                            key=_extra_key,
                         )
-                        _garimpo_absorver_uploads_extra_no_lote(extra_files)
+                        if extra_files is not None:
+                            _n_add = _garimpo_absorver_uploads_extra_no_lote([extra_files])
+                            if _n_add:
+                                st.success("Ficheiro incorporado ao lote.")
+                            try:
+                                st.session_state.pop(_extra_key, None)
+                            except Exception:
+                                pass
+                            st.session_state["_extra_files_uploader_rev"] = _extra_rev + 1
+                            st.rerun()
                         st.caption(
-                            "Os ficheiros passam **para o lote ao serem escolhidos** (e de novo em **Processar Dados** se ainda estiverem no campo); o relatório é recalculado a partir do lote completo."
+                            "Cada ficheiro entra no lote no momento da escolha; o campo é limpo a seguir para poupar memória."
                         )
 
                     # =====================================================================
@@ -11978,7 +12059,10 @@ O que esperar de cada modelo:
                         tab_b, tab_p, tab_f = st.tabs(["Dos buracos", "Planilha (Excel/CSV)", "Faixa de números"])
 
                         with tab_b:
-                            df_b = st.session_state["df_faltantes"].copy()
+                            df_b = filtrar_df_faltantes_entre_xml_lidos(
+                                st.session_state["df_faltantes"].copy(),
+                                st.session_state.get("df_resumo"),
+                            )
                             if not df_b.empty and "Serie" in df_b.columns and "Série" not in df_b.columns:
                                 df_b = df_b.rename(columns={"Serie": "Série"})
                             if df_b.empty:
@@ -12045,7 +12129,10 @@ O que esperar de cada modelo:
                             _n0 = _c1f.number_input("Nota inicial", min_value=1, value=1, step=1, key="inut_f_i")
                             _n1 = _c2f.number_input("Nota final", min_value=1, value=1, step=1, key="inut_f_f")
                             _MAX_FAIXA_INUT = 5000
-                            df_fb = st.session_state["df_faltantes"].copy()
+                            df_fb = filtrar_df_faltantes_entre_xml_lidos(
+                                st.session_state["df_faltantes"].copy(),
+                                st.session_state.get("df_resumo"),
+                            )
                             if not df_fb.empty and "Serie" in df_fb.columns and "Série" not in df_fb.columns:
                                 df_fb = df_fb.rename(columns={"Serie": "Série"})
                             _bur_f = set()
@@ -12082,7 +12169,10 @@ O que esperar de cada modelo:
                         tab_cb, tab_cp, tab_cf = st.tabs(["Dos buracos", "Planilha (Excel/CSV)", "Faixa de números"])
 
                         with tab_cb:
-                            df_cb = st.session_state["df_faltantes"].copy()
+                            df_cb = filtrar_df_faltantes_entre_xml_lidos(
+                                st.session_state["df_faltantes"].copy(),
+                                st.session_state.get("df_resumo"),
+                            )
                             if not df_cb.empty and "Serie" in df_cb.columns and "Série" not in df_cb.columns:
                                 df_cb = df_cb.rename(columns={"Serie": "Série"})
                             if df_cb.empty:
@@ -12150,7 +12240,10 @@ O que esperar de cada modelo:
                             _c1fc.number_input("Nota inicial", min_value=1, value=1, step=1, key="canc_f_i")
                             _c2fc.number_input("Nota final", min_value=1, value=1, step=1, key="canc_f_f")
                             _MAX_FAIXA_CANC_UI = 5000
-                            df_cfb = st.session_state["df_faltantes"].copy()
+                            df_cfb = filtrar_df_faltantes_entre_xml_lidos(
+                                st.session_state["df_faltantes"].copy(),
+                                st.session_state.get("df_resumo"),
+                            )
                             if not df_cfb.empty and "Serie" in df_cfb.columns and "Série" not in df_cfb.columns:
                                 df_cfb = df_cfb.rename(columns={"Serie": "Série"})
                             _bur_cfu = set()
@@ -12182,8 +12275,12 @@ O que esperar de cada modelo:
                         "Processar Dados",
                         key="btn_reprocessar_garimpo",
                         type="primary",
+                        help=(
+                            "Lê o lote completo (antigos + novos), aplica inutilizações/canceladas manuais e "
+                            "recalcula os resultados. Arquivos repetidos não duplicam no lote."
+                        ),
                     ):
-                        _ef = st.session_state.get("extra_files")
+                        _ef = None
                         if _ef is not None and not isinstance(_ef, (list, tuple)):
                             _ef = [_ef]
                         _pick = list(st.session_state.get("inut_b_pick") or [])
