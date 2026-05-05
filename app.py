@@ -325,7 +325,7 @@ def _ui_scroll_to_top() -> None:
 # --- CONFIGURAÇÃO E ESTILO (CLONE ABSOLUTO DO DIAMOND TAX) ---
 if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
     try:
-        st.set_page_config(page_title="Garimpeiro", layout="wide", page_icon=":round_pushpin:")
+        st.set_page_config(page_title="Garimpeiro", layout="wide", page_icon="⛏️")
     except Exception:
         pass
 
@@ -1006,11 +1006,7 @@ def _garimpo_mostrar_campo_pasta_lote_entrada() -> bool:
       `GARIMPEIRO_LOTE_DESDE_PASTA=1` quando há volume montado de confiança.
     """
     if _streamlit_likely_community_cloud():
-        return os.environ.get("GARIMPEIRO_LOTE_DESDE_PASTA", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        return False
     return True
 
 
@@ -1159,6 +1155,9 @@ def _garimpo_destino_copia_lote_opcional():
     Em branco → (None, None). Caminho inválido → (None, mensagem).
     Não bloqueia por Cloud: se o caminho for válido neste SO, grava já na leitura (PC local ou servidor Linux com pasta acessível).
     """
+    usar_pasta = bool(st.session_state.get("mariana_usar_pasta_destino"))
+    if not usar_pasta:
+        return None, None
     s = ""
     for _key in ("mariana_zip_save_dir", SESSION_KEY_GARIMPO_LOTE_SAVE_DIR):
         raw = st.session_state.get(_key)
@@ -1549,6 +1548,18 @@ _PACOTE_CONTAB_NOME_EXCEL_RAIZ = "relatorio_garimpeiro_completo.xlsx"
 # Pasta â€œmÃ£eâ€ dentro de cada ZIP de contabilidade; dentro dela vêm Lote_001, Lote_002, … (até MAX_XML_PER_ZIP XML por pasta).
 PACOTE_CONTAB_PASTA_MAE_XML = "XML"
 
+# «Pacote de extração» — três modos na Etapa 3 (sem filtros da grelha).
+PACOTE_EXTRACAO_MODO_MATRIZ = "matriz"
+PACOTE_EXTRACAO_MODO_DOMINIO_ZIP = "dominio_zip"
+PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA = "autenticidade_pasta"
+PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO = "pasta_padrao"
+PACOTE_EXTRACAO_SUBMOD_PASTA_AUTENTICIDADE = "pasta_autenticidade"
+_MODELOS_TERCEIROS_PACOTE_DOMINIO = frozenset({"NF-e", "CT-e", "CT-e OS"})
+_STATUS_DOMINIO_VALIDOS = frozenset(
+    {"NORMAIS", "CANCELADOS", "INUTILIZADOS", "INUTILIZADA"}
+)
+_AUTENTICIDADE_PASTA_MAX_XML = 5000
+
 
 def _nome_excel_pacote_contab_dentro_zip(slug: str) -> str:
     """
@@ -1586,8 +1597,8 @@ def _pacote_contab_status_curto(status_text) -> str:
     return _v2_sanitize_nome_export(st, max_len=24) or "Outros_status"
 
 
-def _pacote_contab_tipo_zip_terceiros(modelo) -> str:
-    """Grupo do nome do ZIP para terceiros (um par modeloÃ—status por ficheiro)."""
+def _pacote_contab_tipo_modelo_token(modelo) -> str:
+    """Token de modelo para nomes de grupo/ZIP no pacote."""
     m = str(modelo or "").strip()
     return {
         "NF-e": "NFe",
@@ -1597,6 +1608,16 @@ def _pacote_contab_tipo_zip_terceiros(modelo) -> str:
         "NFS-e": "NFSe",
         "CT-e OS": "CTeOS",
     }.get(m, "Outros")
+
+
+def _pacote_contab_tipo_zip_terceiros(modelo) -> str:
+    """Terceiros em dois grupos: NFe ou CTe (CT-e OS agrega em CTe)."""
+    m = str(modelo or "").strip()
+    if m in ("CT-e", "CT-e OS"):
+        return "CTe"
+    if m == "NF-e":
+        return "NFe"
+    return ""
 
 
 def _pacote_contab_op_slug(operacao) -> str:
@@ -1623,7 +1644,11 @@ def _pacote_contab_slug_grupo(
     - **Terceiros:** ano / mês / status / modelo.
     """
     st_short = _pacote_contab_status_curto(status_text)
-    mod_tok = _pacote_contab_tipo_zip_terceiros(modelo)
+    mod_tok = (
+        _pacote_contab_tipo_modelo_token(modelo)
+        if is_propria
+        else _pacote_contab_tipo_zip_terceiros(modelo)
+    )
     try:
         a = int(ano)
         m = int(mes)
@@ -1637,7 +1662,7 @@ def _pacote_contab_slug_grupo(
         ser = _v2_sanitize_nome_export(ser_raw, max_len=16) or "0"
         op = _pacote_contab_op_slug(operacao)
         return f"EP_{aa}_{mm}_Serie_{ser}_{op}_{st_short}_{mod_tok}"
-    return f"T_{aa}_{mm}_{st_short}_{mod_tok}"
+    return f"T_{aa}_{mm}_{st_short}_{mod_tok}" if mod_tok else ""
 
 
 def _pacote_contab_slug_emitidas_com_mes(
@@ -1660,6 +1685,8 @@ def _montar_mapa_chave_slug_contab(df: pd.DataFrame, chaves_permitidas: set) -> 
             continue
         is_pr = _origem_row_e_propria(row.get("Origem", ""))
         mod = row.get("Modelo", "") or row.get("Tipo", "")
+        if (not is_pr) and str(mod).strip() not in _MODELOS_TERCEIROS_PACOTE_DOMINIO:
+            continue
         ano = row["Ano"] if "Ano" in row.index else None
         mes = row["Mes"] if "Mes" in row.index else None
         slug = _pacote_contab_slug_emitidas_com_mes(
@@ -1671,7 +1698,77 @@ def _montar_mapa_chave_slug_contab(df: pd.DataFrame, chaves_permitidas: set) -> 
             mes,
             row.get("Operação") or row.get("Operacao"),
         )
+        if not slug:
+            continue
         out[k] = slug
+    return out
+
+
+def _df_geral_para_pacote_dominio(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Critério «leitura Domínio»: emissão própria + terceiros (NF-e/CT-e/CT-e OS),
+    com status de interesse: Autorizadas, Canceladas e Inutilizadas.
+    """
+    if df is None or getattr(df, "empty", True) or "Chave" not in df.columns:
+        return pd.DataFrame()
+    if "Status Final" not in df.columns:
+        return pd.DataFrame()
+    st_ok = df["Status Final"].astype(str).str.upper().isin(_STATUS_DOMINIO_VALIDOS)
+    mp = _mask_emissao_propria_df(df) & st_ok
+    mt = _mask_terceiros_df(df) & st_ok
+    partes = []
+    if mp.any():
+        partes.append(df.loc[mp])
+    if mt.any() and "Modelo" in df.columns:
+        df_ter = df.loc[mt]
+        m_ok = df_ter["Modelo"].astype(str).isin(_MODELOS_TERCEIROS_PACOTE_DOMINIO)
+        if m_ok.any():
+            partes.append(df_ter.loc[m_ok])
+    if not partes:
+        return pd.DataFrame()
+    out = pd.concat(partes, ignore_index=True)
+    if "Chave" in out.columns:
+        out = out.drop_duplicates(subset=["Chave"], keep="first")
+    return out
+
+
+def _pacote_dominio_slug_grupo(
+    is_propria: bool, status_text, serie, modelo, ano, mes
+) -> str:
+    """ZIP/pasta Domínio: própria por mês×série×status; terceiros por mês×modelo×status."""
+    mod_tok = _pacote_contab_tipo_zip_terceiros(modelo)
+    st_short = _pacote_contab_status_curto(status_text)
+    try:
+        a = int(ano)
+        m = int(mes)
+        if a <= 0 or m < 1 or m > 12:
+            raise ValueError
+        aa, mm = f"{a:04d}", f"{m:02d}"
+    except (TypeError, ValueError):
+        aa, mm = "0000", "00"
+    ser_raw = str(serie if serie is not None else "").strip() or "0"
+    ser = _v2_sanitize_nome_export(ser_raw, max_len=16) or "0"
+    if is_propria:
+        return f"DOM_EP_{aa}_{mm}_Serie_{ser}_{st_short}"
+    return f"DOM_T_{aa}_{mm}_{st_short}_{mod_tok}"
+
+
+def _montar_mapa_chave_slug_dominio(df: pd.DataFrame, chaves_permitidas: set) -> dict:
+    out = {}
+    if df is None or df.empty or "Chave" not in df.columns or not chaves_permitidas:
+        return out
+    for _, row in df.iterrows():
+        k = _chave_para_conjunto_export(row.get("Chave"))
+        if not k or k not in chaves_permitidas:
+            continue
+        is_pr = _origem_row_e_propria(row.get("Origem", ""))
+        mod = row.get("Modelo", "") or row.get("Tipo", "")
+        ano = row["Ano"] if "Ano" in row.index else None
+        mes = row["Mes"] if "Mes" in row.index else None
+        ser = row.get("Série", "0")
+        out[k] = _pacote_dominio_slug_grupo(
+            is_pr, row.get("Status Final", ""), ser, mod, ano, mes
+        )
     return out
 
 
@@ -1731,6 +1828,9 @@ def _v2_export_pacote_contab_por_dimensoes(
     xb_completo,
     excel_fn_completo: str,
     df_ref: pd.DataFrame,
+    *,
+    layout_zip_xml=None,
+    slug_mode: str = "contab",
 ):
     """
     ZIP por emitida (status Ã— sÃ©rie Ã— **mÃªs**) ou por terceiros (modelo Ã— status Ã— **mÃªs** de emissão).
@@ -1741,14 +1841,27 @@ def _v2_export_pacote_contab_por_dimensoes(
     **só desse ZIP** (ex.: 1–10 000, 10 001–20 000). O Excel completo de **todo** o lote continua **solto** em ``out_dir``.
     Grava também o Excel completo **solto** em out_dir (prefixo = stem_org).
     Devolve (paths, [], matched, aviso, caminho_excel_solta|None).
+    layout_zip_xml: None â†’ usa o modo ZIP do garimpo (sessão); ``matriz`` â†’ sempre ``XML/Lote_…``;
+    ``dominio_flat`` â†’ XML só na raiz do .zip (leitura Domínio).
+    slug_mode: ``contab`` (grupos EP_/T_ com status) ou ``dominio`` (DOM_EP_/DOM_T_ sem status nos próprios).
     """
-    mapa_slug = _montar_mapa_chave_slug_contab(df_ref, filtro_chaves)
+    if slug_mode == "dominio":
+        mapa_slug = _montar_mapa_chave_slug_dominio(df_ref, filtro_chaves)
+    else:
+        mapa_slug = _montar_mapa_chave_slug_contab(df_ref, filtro_chaves)
     slug_ranges = _pacote_contab_notas_min_max_por_slug(df_ref, mapa_slug, filtro_chaves)
     zips_abertos = {}
     paths_ordered = {}
     slug_lote_idx = {}
     slug_in_lote = {}
-    _zip_dom = _garimpo_extracao_zip_pacote() == "dominio"
+    if layout_zip_xml == "dominio_flat":
+        _zip_dom = True
+    elif layout_zip_xml == "matriz":
+        _zip_dom = False
+    elif layout_zip_xml is None:
+        _zip_dom = _garimpo_extracao_zip_pacote() == "dominio"
+    else:
+        _zip_dom = _garimpo_extracao_zip_pacote() == "dominio"
     slug_zip_part = {}
     slug_zip_count = {}
     _dom_paths_temp: dict = {}
@@ -1865,15 +1978,28 @@ def _v2_export_pacote_contab_por_dimensoes(
                         continue
                     chaves_ja_gravadas_pacote.add(td)
                     xml_matched += 1
-                    slug = mapa_slug.get(ck) or _pacote_contab_slug_emitidas_com_mes(
-                        is_p,
-                        str(res.get("Status") or "NORMAIS"),
-                        res.get("Série", "0"),
-                        res.get("Tipo", "Outros"),
-                        res.get("Ano"),
-                        res.get("Mes"),
-                        res.get("Operacao"),
-                    )
+                    if slug_mode == "dominio":
+                        slug = mapa_slug.get(ck) or _pacote_dominio_slug_grupo(
+                            is_p,
+                            str(res.get("Status") or "NORMAIS"),
+                            res.get("Série", "0"),
+                            res.get("Tipo", "Outros"),
+                            res.get("Ano"),
+                            res.get("Mes"),
+                        )
+                    else:
+                        slug = mapa_slug.get(ck) or _pacote_contab_slug_emitidas_com_mes(
+                            is_p,
+                            str(res.get("Status") or "NORMAIS"),
+                            res.get("Série", "0"),
+                            res.get("Tipo", "Outros"),
+                            res.get("Ano"),
+                            res.get("Mes"),
+                            res.get("Operacao"),
+                        )
+                    if not slug:
+                        del xml_data
+                        continue
                     nome_xml = _nome_arquivo_xml_contabilidade(res, name)
                     if _zip_dom:
                         part = slug_zip_part.get(slug, 0)
@@ -1943,6 +2069,202 @@ def _v2_export_pacote_contab_por_dimensoes(
             "Causas frequentes: pasta do garimpo apagada, ou chaves na tabela que não batem com os ficheiros."
         )
     _paths_list = sorted(paths_ordered.values(), key=lambda p: os.path.basename(p).lower())
+    return _paths_list, [], xml_matched, aviso, excel_solta_path
+
+
+def _escrever_bytes_xml_em_pasta(dest_dir: Path, nome_xml: str, xml_data: bytes) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    p = dest_dir / nome_xml
+    if not p.exists():
+        p.write_bytes(xml_data)
+        return
+    stem, suf = os.path.splitext(nome_xml)
+    for i in range(2, 10000):
+        alt = dest_dir / f"{stem}_{i}{suf}"
+        if not alt.exists():
+            alt.write_bytes(xml_data)
+            return
+
+
+def _v2_export_pacote_autenticidade_em_pastas(
+    out_dir: Path,
+    stem_org: str,
+    filtro_chaves: set,
+    cnpj_limpo: str,
+    xb_completo,
+    excel_fn_completo: str,
+    df_ref: pd.DataFrame,
+):
+    """
+    Igual ao ZIP «Domínio» (XML na raiz, até MAX_XML por pasta), mas **sem .zip**:
+    uma pasta por grupo (prefixo + slug), com partes ``_pt02`` quando ultrapassa o limite.
+    """
+    mapa_slug = _montar_mapa_chave_slug_dominio(df_ref, filtro_chaves)
+    slug_zip_part: dict[str, int] = {}
+    slug_zip_count: dict[tuple[str, int], int] = {}
+    pastas_top = set()
+    xml_matched = 0
+    chaves_ja_gravadas_pacote = set()
+
+    def _dir_grupo(slug: str, part: int) -> Path:
+        stem_safe = _v2_sanitize_nome_export(stem_org, max_len=60) or "pacote"
+        slug_safe = _v2_sanitize_nome_export(slug, max_len=120) or "lote"
+        nome = f"{stem_safe}__{slug_safe}" + (f"_pt{part + 1:02d}" if part > 0 else "")
+        return out_dir / nome
+
+    for f_name in _lista_nomes_fontes_xml_garimpo():
+        with _abrir_fonte_xml_garimpo_stream(f_name) as f_temp:
+            for name, xml_data in extrair_recursivo(f_temp, f_name):
+                res, is_p = identify_xml_info(xml_data, cnpj_limpo, name)
+                ck = _chave_para_conjunto_export(res["Chave"]) if res else None
+                if res and ck and ck in filtro_chaves:
+                    td = _tupla_dedupe_export_xml(res, ck)
+                    if td is None or td in chaves_ja_gravadas_pacote:
+                        del xml_data
+                        continue
+                    chaves_ja_gravadas_pacote.add(td)
+                    xml_matched += 1
+                    slug = mapa_slug.get(ck) or _pacote_dominio_slug_grupo(
+                        is_p,
+                        str(res.get("Status") or "NORMAIS"),
+                        res.get("Série", "0"),
+                        res.get("Tipo", "Outros"),
+                        res.get("Ano"),
+                        res.get("Mes"),
+                    )
+                    if not slug:
+                        del xml_data
+                        continue
+                    part = slug_zip_part.get(slug, 0)
+                    k = (slug, part)
+                    n = slug_zip_count.get(k, 0)
+                    if n >= MAX_XML_PER_ZIP:
+                        part += 1
+                        slug_zip_part[slug] = part
+                        k = (slug, part)
+                        n = 0
+                    dest_dir = _dir_grupo(slug, part)
+                    nome_xml = _nome_arquivo_xml_contabilidade(res, name)
+                    raw = xml_data if isinstance(xml_data, (bytes, bytearray)) else bytes(xml_data)
+                    _escrever_bytes_xml_em_pasta(dest_dir, nome_xml, raw)
+                    pastas_top.add(str(dest_dir.resolve()))
+                    slug_zip_count[k] = n + 1
+                del xml_data
+
+    excel_solta_path = None
+    if xb_completo:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stem_safe = _v2_sanitize_nome_export(stem_org, max_len=80) or "pacote_apuracao"
+            nome_xlsx = _v2_sanitize_nome_export(
+                f"{stem_safe}_{_PACOTE_CONTAB_NOME_EXCEL_RAIZ}", max_len=200
+            ) or _PACOTE_CONTAB_NOME_EXCEL_RAIZ
+            if not str(nome_xlsx).lower().endswith(".xlsx"):
+                nome_xlsx = f"{nome_xlsx}.xlsx"
+            p_x = out_dir / nome_xlsx
+            _raw = (
+                xb_completo
+                if isinstance(xb_completo, (bytes, bytearray))
+                else bytes(xb_completo)
+            )
+            with open(p_x, "wb") as xf:
+                xf.write(_raw)
+            excel_solta_path = str(p_x.resolve())
+        except OSError:
+            excel_solta_path = None
+
+    aviso = None
+    if xml_matched == 0:
+        aviso = (
+            "Nenhum XML em disco correspondeu às chaves. "
+            "Causas frequentes: pasta do garimpo apagada, ou chaves na tabela que não batem com os ficheiros."
+        )
+    _paths_list = sorted(pastas_top, key=lambda p: os.path.basename(p).lower())
+    return _paths_list, [], xml_matched, aviso, excel_solta_path
+
+
+def _v2_export_pacote_autenticidade_submodulo_em_pastas(
+    out_dir: Path,
+    stem_org: str,
+    filtro_chaves: set,
+    cnpj_limpo: str,
+    xb_completo,
+):
+    """
+    Submódulo «Autenticidade»: sem ZIP, só pastas abertas por modelo (NFe/CTe),
+    em lotes de até 5.000 XML por pasta. Ignora status/origem para facilitar leitura externa.
+    """
+    cont = {"NFe": 0, "CTe": 0}
+    part = {"NFe": 1, "CTe": 1}
+    pastas_top = set()
+    xml_matched = 0
+    chaves_ja_gravadas = set()
+
+    def _token_modelo(res) -> str:
+        m = str(res.get("Tipo") or "").strip()
+        if m in ("CT-e", "CT-e OS"):
+            return "CTe"
+        if m == "NF-e":
+            return "NFe"
+        return ""
+
+    def _dest_dir(tok: str, idx: int) -> Path:
+        stem_safe = _v2_sanitize_nome_export(stem_org, max_len=60) or "pacote"
+        nome = f"{stem_safe}__AUT_{tok}_Lote_{idx:03d}"
+        return out_dir / nome
+
+    for f_name in _lista_nomes_fontes_xml_garimpo():
+        with _abrir_fonte_xml_garimpo_stream(f_name) as f_temp:
+            for name, xml_data in extrair_recursivo(f_temp, f_name):
+                res, _is_p = identify_xml_info(xml_data, cnpj_limpo, name)
+                ck = _chave_para_conjunto_export(res["Chave"]) if res else None
+                if res and ck and ck in filtro_chaves:
+                    td = _tupla_dedupe_export_xml(res, ck)
+                    if td is None or td in chaves_ja_gravadas:
+                        del xml_data
+                        continue
+                    tok = _token_modelo(res)
+                    if not tok:
+                        del xml_data
+                        continue
+                    chaves_ja_gravadas.add(td)
+                    xml_matched += 1
+                    if cont[tok] >= _AUTENTICIDADE_PASTA_MAX_XML:
+                        part[tok] += 1
+                        cont[tok] = 0
+                    ddir = _dest_dir(tok, part[tok])
+                    nome_xml = _nome_arquivo_xml_contabilidade(res, name)
+                    raw = xml_data if isinstance(xml_data, (bytes, bytearray)) else bytes(xml_data)
+                    _escrever_bytes_xml_em_pasta(ddir, nome_xml, raw)
+                    pastas_top.add(str(ddir.resolve()))
+                    cont[tok] += 1
+                del xml_data
+
+    excel_solta_path = None
+    if xb_completo:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stem_safe = _v2_sanitize_nome_export(stem_org, max_len=80) or "pacote_apuracao"
+            nome_xlsx = _v2_sanitize_nome_export(
+                f"{stem_safe}_{_PACOTE_CONTAB_NOME_EXCEL_RAIZ}", max_len=200
+            ) or _PACOTE_CONTAB_NOME_EXCEL_RAIZ
+            if not str(nome_xlsx).lower().endswith(".xlsx"):
+                nome_xlsx = f"{nome_xlsx}.xlsx"
+            p_x = out_dir / nome_xlsx
+            _raw = xb_completo if isinstance(xb_completo, (bytes, bytearray)) else bytes(xb_completo)
+            with open(p_x, "wb") as xf:
+                xf.write(_raw)
+            excel_solta_path = str(p_x.resolve())
+        except OSError:
+            excel_solta_path = None
+
+    aviso = None
+    if xml_matched == 0:
+        aviso = (
+            "Nenhum XML NFe/CTe correspondeu às chaves lidas. "
+            "Verifique se o lote contém esses modelos e se os ficheiros estão acessíveis."
+        )
+    _paths_list = sorted(pastas_top, key=lambda p: os.path.basename(p).lower())
     return _paths_list, [], xml_matched, aviso, excel_solta_path
 
 
@@ -2554,11 +2876,11 @@ def _xml_cancelamento_por_evento_ou_retorno(tag_l: str) -> bool:
     )
 
 
-def _emit_cnpj_bloco_principal_fiscal(tag_l: str, tipo: str) -> str:
+def _emitente_doc_nome_bloco_principal_fiscal(tag_l: str, tipo: str) -> tuple[str, str]:
     """
-    CNPJ do emitente **dentro** do infNFe / infCte / infMDFe do documento.
-    O regex global `<emit>…<cnpj>` apanha por vezes o primeiro `<emit>` de **evento**, **retorno**
-    ou outro anexo antes do documento — CT-e/NF-e de terceiros acabavam como «emissão própria».
+    Documento (CNPJ ou CPF) e razão social do emitente **no** infNFe / infCte / infMDFe do documento.
+    O regex global `<emit>…` apanha por vezes o primeiro `<emit>` de **evento** ou retorno — NF-e/CT-e
+    de terceiros podiam ficar como «emissão própria»; o nome do emitente herdava o mesmo erro.
     """
     if tipo in ("CT-e", "CT-e OS"):
         open_pat = r"<(?:\w+:)?infcte\b[^>]*>"
@@ -2567,16 +2889,32 @@ def _emit_cnpj_bloco_principal_fiscal(tag_l: str, tipo: str) -> str:
     elif tipo in ("NF-e", "NFC-e"):
         open_pat = r"<(?:\w+:)?infnfe\b[^>]*>"
     else:
-        return ""
+        return "", ""
     m = re.search(open_pat, tag_l, re.I)
     if not m:
-        return ""
+        return "", ""
     chunk = tag_l[m.start() : m.start() + 600000]
+    doc = ""
     em = re.search(
         r"(?:<\w+:emit\b|<emit\b)[^>]*>[\s\S]{0,12000}?(?:<\w+:cnpj>|<cnpj>)(\d{11,14})</(?:\w+:cnpj|cnpj)>",
         chunk,
     )
-    return em.group(1) if em else ""
+    if em:
+        doc = em.group(1)
+    if not doc:
+        em_cpf = re.search(
+            r"(?:<\w+:emit\b|<emit\b)[^>]*>[\s\S]{0,12000}?(?:<\w+:cpf>|<cpf>)(\d{11})</(?:\w+:cpf|cpf)>",
+            chunk,
+        )
+        if em_cpf:
+            doc = em_cpf.group(1)
+    nom_m = re.search(
+        r"(?:<\w+:emit\b|<emit\b)[^>]*>[\s\S]{0,12000}?(?:<\w+:xnome>|<xnome>)(.*?)</(?:\w+:xnome|xnome)>",
+        chunk,
+        re.S,
+    )
+    nome = nom_m.group(1).strip() if nom_m else ""
+    return doc, nome
 
 
 def identify_xml_info(content_bytes, client_cnpj, file_name):
@@ -2798,9 +3136,11 @@ def identify_xml_info(content_bytes, client_cnpj, file_name):
                 
             resumo["Tipo"] = tipo
             resumo["Status"] = status
-            _emit_bloco = _emit_cnpj_bloco_principal_fiscal(tag_l, tipo)
-            if _emit_bloco:
-                resumo["CNPJ_Emit"] = _emit_bloco
+            _emit_doc, _emit_nom = _emitente_doc_nome_bloco_principal_fiscal(tag_l, tipo)
+            if _emit_doc:
+                resumo["CNPJ_Emit"] = _emit_doc
+            if _emit_nom:
+                resumo["Nome_Emit"] = _emit_nom.strip().upper()
             # Carta de correção (evento 110110): não entra no lote nem no dashboard/PDF.
             if status == "CARTA_CORRECAO":
                 return None, False
@@ -6118,7 +6458,17 @@ def _garim_footer_overlay_remove():
     )
 
 
-def _garim_footer_overlay_paint(cur, total, arquivo, fase, t_start):
+def _garim_footer_overlay_paint(
+    cur,
+    total,
+    arquivo,
+    fase,
+    t_start,
+    proximo="",
+    eventos=None,
+    etapas=None,
+    etapa_idx=0,
+):
     """
     Cartão de estado **no topo da janela**, fixo ao viewport (acompanha o scroll), acima do layout Streamlit.
     O tempo decorrido atualiza no **browser** (setInterval) a partir de `t_start` = `time.time()` no início da operação.
@@ -6133,9 +6483,42 @@ def _garim_footer_overlay_paint(cur, total, arquivo, fase, t_start):
     _an = str(arquivo or "—").replace("\\", "/")
     _base = os.path.basename(_an) or _an
     arq = html_escape.escape(_base)[:72]
-    fase_e = html_escape.escape(str(fase or ""))[:56]
+    fase_e = html_escape.escape(str(fase or ""))[:84]
     elapsed0 = html_escape.escape(_garim_footer_elapsed_txt(t_start))
     tit = html_escape.escape(f"{fase or ''} · {_base}")[:220]
+    prox_e = html_escape.escape(str(proximo or "")).strip()[:160]
+    _evs = list(eventos or [])[-4:]
+    _et = list(etapas or [])
+    ev_html = ""
+    if _evs:
+        _parts = []
+        for ev in _evs:
+            _txt = str(ev or "").replace("`", "").strip()
+            if not _txt:
+                continue
+            _parts.append(
+                f'<div style="opacity:.92;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">• {html_escape.escape(_txt)[:130]}</div>'
+            )
+        if _parts:
+            ev_html = "".join(_parts)
+    etapas_html = ""
+    if _et:
+        _chk = []
+        for i, nm in enumerate(_et):
+            n = html_escape.escape(str(nm or "")).strip()[:80]
+            if not n:
+                continue
+            if i < int(etapa_idx or 0):
+                ico = "✅"
+            elif i == int(etapa_idx or 0):
+                ico = "🔄"
+            else:
+                ico = "⏳"
+            _chk.append(
+                f'<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{ico} {n}</div>'
+            )
+        if _chk:
+            etapas_html = "".join(_chk)
     try:
         start_ms = int(float(t_start) * 1000) if t_start is not None else 0
     except (TypeError, ValueError):
@@ -6157,9 +6540,17 @@ def _garim_footer_overlay_paint(cur, total, arquivo, fase, t_start):
         "<span style=\"font-variant-numeric:tabular-nums;white-space:nowrap;\">⏱ "
         f'<span id="garimpeiro-overlay-elapsed">{elapsed0}</span></span>'
         f"<span style=\"opacity:0.9;white-space:nowrap;\"><b>{c}</b>/<b>{tot}</b></span>"
-        f'<span style="flex:1;min-width:96px;opacity:0.88;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'
+        f'<span style="flex:1;min-width:96px;opacity:0.92;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'
         f'font-size:0.74rem;" title="{tit}">{fase_e} · {arq}</span>'
         "</div>"
+    )
+    if prox_e:
+        inner += f'<div style="margin-top:0.26rem;font-size:0.73rem;opacity:.94;"><b>Próximo:</b> {prox_e}</div>'
+    if etapas_html:
+        inner += f'<div style="margin-top:0.24rem;font-size:0.72rem;line-height:1.25;"><b>Checklist</b>{etapas_html}</div>'
+    if ev_html:
+        inner += f'<div style="margin-top:0.24rem;font-size:0.72rem;line-height:1.25;"><b>Últimos eventos</b>{ev_html}</div>'
+    inner += (
         f"<div style=\"margin-top:0.38rem;height:7px;background:rgba(255,105,180,0.14);border-radius:6px;overflow:hidden;\">"
         f"<div style=\"width:{pct:.1f}%;height:100%;background:linear-gradient(90deg,#ff9ec7,#ff69b4);border-radius:6px;\">"
         "</div></div></div></div>"
@@ -6217,13 +6608,34 @@ def _garim_footer_overlay_paint(cur, total, arquivo, fase, t_start):
     )
 
 
-def _garim_footer_render(placeholder, cur, total, arquivo, fase, t_start):
+def _garim_footer_render(
+    placeholder,
+    cur,
+    total,
+    arquivo,
+    fase,
+    t_start,
+    proximo="",
+    eventos=None,
+    etapas=None,
+    etapa_idx=0,
+):
     """
     Atualiza o cartão global de progresso (topo do ecrã, fixo ao viewport).
     `placeholder`, se não for None, é esvaziado — o conteúdo real vai para o `document` da janela principal.
     """
     try:
-        _garim_footer_overlay_paint(cur, total, arquivo, fase, t_start)
+        _garim_footer_overlay_paint(
+            cur,
+            total,
+            arquivo,
+            fase,
+            t_start,
+            proximo=proximo,
+            eventos=eventos,
+            etapas=etapas,
+            etapa_idx=etapa_idx,
+        )
     except Exception:
         pass
     if placeholder is not None:
@@ -6865,7 +7277,7 @@ def filtrar_df_geral_para_exportacao(
         out_p = out_p[out_p["Série"].astype(str).isin(ser_set)]
 
     modo_f = _v2_parse_modo_faixa(filtro_faixa_modo_label or "Qualquer")
-    if modo_f and len(filtro_series) > 0:
+    if modo_f:
         n1 = int(filtro_faixa_n1) if filtro_faixa_n1 is not None else 0
         n2 = int(filtro_faixa_n2) if filtro_faixa_n2 is not None else n1
         out_p = _v2_aplicar_filtro_faixa_nota(out_p, modo_f, n1, n2)
@@ -7111,6 +7523,7 @@ def _v2_export_zip_etapa3(
     pacote_pastas_garimpo: bool = False,
     pacote_pastas_contabilidade: bool = False,
     df_excel_todas_notas=None,
+    pacote_layout_zip_force=None,
 ):
     """
     Escreve ZIP(s) em disco (org / plano).
@@ -7197,6 +7610,8 @@ def _v2_export_zip_etapa3(
             xb_completo,
             excel_fn_completo,
             _df_ch,
+            layout_zip_xml=pacote_layout_zip_force,
+            slug_mode="contab",
         )
         if aviso_sem_espaco_excel:
             av = (
@@ -7368,6 +7783,99 @@ def _v2_export_zip_etapa3(
     return org_parts, todos_parts, Z["xml_matched"], aviso, None
 
 
+def _v2_export_pacote_extracao(
+    df_geral: pd.DataFrame,
+    cnpj_limpo: str,
+    *,
+    zip_output_dir: Path,
+    zip_file_stem=None,
+    modo: str = PACOTE_EXTRACAO_MODO_MATRIZ,
+    submodo_pasta_aberta: str = PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO,
+):
+    """
+    Pacote de extração (Etapa 3): **todo** o lote lido, **sem** filtros da grelha.
+    • matriz — contabilidade detalhada (grupos EP_/T_ com status), ZIP plano com XML na raiz (sem pastas internas).
+    • dominio_zip — leitura Domínio: ZIP com XML na raiz (até 10k por ficheiro); terceiros só NF-e/CT-e/OS;
+      própria por mês×série×modelo (sem status no nome).
+    • autenticidade_pasta — pastas abertas (sem .zip). Submódulo padrão = regra Domínio;
+      submódulo autenticidade = só NFe/CTe em lotes de 5.000 XML por pasta.
+    """
+    nome = str(zip_file_stem or "").strip()
+    out_dir = Path(zip_output_dir).resolve()
+
+    if modo == PACOTE_EXTRACAO_MODO_MATRIZ:
+        o, _t, xm, av, xls = _v2_export_zip_etapa3(
+            df_geral,
+            xml_respeita_filtro=False,
+            df_filtrado_para_excel_bloco=df_geral,
+            excel_um_so_completo=True,
+            df_excel_completo=df_geral,
+            v2_zip_org=True,
+            v2_zip_plano=False,
+            cnpj_limpo=cnpj_limpo,
+            zip_tag=None,
+            zip_output_dir=out_dir,
+            zip_nome_ficheiro=nome,
+            pacote_pastas_garimpo=True,
+            pacote_pastas_contabilidade=True,
+            df_excel_todas_notas=df_geral,
+            pacote_layout_zip_force="dominio_flat",
+        )
+        return o, xm, av, xls
+
+    df_dom = _df_geral_para_pacote_dominio(df_geral)
+    if df_dom is None or df_dom.empty:
+        return (
+            [],
+            0,
+            "ERR:Nenhum documento para este pacote (Domínio: terceiros só NF-e / CT-e / CT-e OS; emissão própria incluída).",
+            None,
+        )
+    filtro_chaves = {
+        k
+        for k in (_chave_para_conjunto_export(x) for x in df_dom["Chave"].tolist())
+        if k
+    }
+    if not filtro_chaves:
+        return [], 0, "ERR:Nenhuma chave válida para exportar XML.", None
+
+    xb_completo = _xb_completo_pacote_contabilidade_de_df_geral(df_geral)
+
+    if modo == PACOTE_EXTRACAO_MODO_DOMINIO_ZIP:
+        paths, _empty, xm, av, xls = _v2_export_pacote_contab_por_dimensoes(
+            out_dir,
+            nome,
+            filtro_chaves,
+            cnpj_limpo,
+            xb_completo,
+            _PACOTE_CONTAB_NOME_EXCEL_RAIZ,
+            df_dom,
+            layout_zip_xml="dominio_flat",
+            slug_mode="dominio",
+        )
+        return paths, xm, av, xls
+
+    if submodo_pasta_aberta == PACOTE_EXTRACAO_SUBMOD_PASTA_AUTENTICIDADE:
+        paths, _e, xm, av, xls = _v2_export_pacote_autenticidade_submodulo_em_pastas(
+            out_dir,
+            nome,
+            filtro_chaves,
+            cnpj_limpo,
+            xb_completo,
+        )
+    else:
+        paths, _e, xm, av, xls = _v2_export_pacote_autenticidade_em_pastas(
+            out_dir,
+            nome,
+            filtro_chaves,
+            cnpj_limpo,
+            xb_completo,
+            _PACOTE_CONTAB_NOME_EXCEL_RAIZ,
+            df_dom,
+        )
+    return paths, xm, av, xls
+
+
 def _v2_export_zip_mariana(
     df_geral: pd.DataFrame,
     cnpj_limpo: str,
@@ -7375,29 +7883,14 @@ def _v2_export_zip_mariana(
     zip_output_dir: Path,
     zip_file_stem=None,
 ):
-    """
-    Pacote contabilidade/matriz: **todo** o lote lido no garimpo (df_geral), **sem** filtros da Etapa 3.
-    ZIPs por grupo: **própria** `EP_ano_mes_Serie_…_Entrada|Saida_status_modelo`; **terceiros** `T_ano_mes_status_modelo`;
-    sufixo `_notas_min_max` nos .zip quando aplicável; dentro: `XML/Lote_001…` (10k/pasta) + Excel na raiz.
-    """
-    nome = str(zip_file_stem or "").strip()
-    o, _t, xm, av, xls = _v2_export_zip_etapa3(
+    """Compatível: mesmo que ``_v2_export_pacote_extracao`` em modo **matriz**."""
+    return _v2_export_pacote_extracao(
         df_geral,
-        xml_respeita_filtro=False,
-        df_filtrado_para_excel_bloco=df_geral,
-        excel_um_so_completo=True,
-        df_excel_completo=df_geral,
-        v2_zip_org=True,
-        v2_zip_plano=False,
-        cnpj_limpo=cnpj_limpo,
-        zip_tag=None,
+        cnpj_limpo,
         zip_output_dir=zip_output_dir,
-        zip_nome_ficheiro=nome,
-        pacote_pastas_garimpo=True,
-        pacote_pastas_contabilidade=True,
-        df_excel_todas_notas=df_geral,
+        zip_file_stem=zip_file_stem,
+        modo=PACOTE_EXTRACAO_MODO_MATRIZ,
     )
-    return o, xm, av, xls
 
 
 def _v2_uniq_sorted_str_series_vals(s: pd.Series) -> list:
@@ -7551,6 +8044,8 @@ def _v2_limpar_estado_exportacao_etapa3(remover_zip_do_disco=True):
     st.session_state.pop("mariana_export_sig", None)
     st.session_state.pop("mariana_sem_xml_msg", None)
     st.session_state.pop("mariana_excel_completo_path", None)
+    st.session_state.pop("mariana_autent_pastas", None)
+    st.session_state.pop("mariana_pacote_modo", None)
 
 
 def v2_assinatura_exportacao_sessao():
@@ -7587,14 +8082,15 @@ def v2_assinatura_exportacao_sessao():
 
 def v2_assinatura_pacote_matriz_sessao(df_geral):
     """
-    Pacote contabilidade / matriz: **não** inclui filtros da Etapa 3.
-    Invalida ao mudar o relatório geral (novo garimpo), pasta/nome do ZIP ou CNPJ na sessão.
+    Pacote de extração: **não** inclui filtros da Etapa 3.
+    Invalida ao mudar o relatório geral (novo garimpo), pasta/nome, CNPJ ou **modelo** de pacote gerado.
     """
     return (
         id(df_geral) if df_geral is not None else 0,
         str(st.session_state.get("mariana_zip_save_dir") or ""),
         str(st.session_state.get("mariana_zip_basename") or ""),
         str(st.session_state.get("cnpj_widget") or ""),
+        str(st.session_state.get("mariana_pacote_modo_sel") or PACOTE_EXTRACAO_MODO_MATRIZ),
     )
 
 
@@ -9569,7 +10065,7 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
         • <b>ZIP filtrado</b> — só XML que passam nos filtros; Excel coerente com esse conjunto.<br/>
         • <b>Só Excel</b> — sem XML.<br/><br/>
         <b>Descargas</b> — use os botões <b>Descarregar</b> no fim desta secção (dois lados: própria e terceiros, quando aplicável). Em cada ZIP, o Excel está em <code>RELATORIO_GARIMPEIRO/</code> (até 10&nbsp;000 XML por parte).<br/><br/>
-        <b>Pacote contabilidade / matriz</b> (secção abaixo) — exporta o lote lido; filtros da Etapa 3 <b>não</b> cortam. Clique em <b>Gerar pacote para descarregar</b> e depois nos botões para obter o Excel e os ZIP.
+        <b>Pacote de extração</b> (expander abaixo, recolhido) — três modelos: contabilidade (matriz), Domínio (ZIP plano) e Autenticidade (pastas sem ZIP). Exporta o lote lido; filtros da Etapa 3 <b>não</b> cortam.
         </div>
                 """,
                     unsafe_allow_html=True,
@@ -9586,7 +10082,7 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
         • <b>ZIP filtrado</b> — só XML que passam nos filtros; Excel coerente com esse conjunto.<br/>
         • <b>Só Excel</b> — sem XML.<br/><br/>
         <b>Descargas</b> — sempre em <b>dois ficheiros</b> (própria e terceiros). Nos ZIP, o Excel está em <code>RELATORIO_GARIMPEIRO/</code> (até 10&nbsp;000 XML por parte).<br/><br/>
-        <b>Pacote contabilidade / matriz</b> (secção <b>Pacote contabilidade</b>, logo abaixo do quadro ZIP/Excel) — exporta o lote lido; filtros da Etapa 3 <b>não</b> cortam. Na pasta escolhida: <b>Excel solto</b> (<code>…_relatorio_garimpeiro_completo.xlsx</code>, sem folha Painel Fiscal) + ZIPs. Em cada ZIP: pasta <code>XML/Lote_001</code>, <code>Lote_002</code>, … (até 10&nbsp;000 XML por pasta) + Excel na raiz com nome <code>relatorio_garimpeiro_…</code> (inclui série/mês/grupo, para não se sobrepor ao extrair); o .zip pode incluir <code>_notas_</code> inicial–final. Grupos: <b>emissão própria</b> <code>EP_ano_mes_Serie_…_Entrada|Saída_status_modelo</code>; <b>terceiros</b> <code>T_ano_mes_status_modelo</code>.
+        <b>Pacote de extração</b> (expander <b>Pacote de extração</b>, ao lado do de filtros) — contabilidade (ZIP com <code>XML/Lote_…</code>); Domínio (ZIP com XML na raiz, até 10&nbsp;000 por ficheiro); Autenticidade (pastas no disco, sem ZIP). Excel completo solto quando aplicável. Filtros da Etapa 3 <b>não</b> cortam este lote.
         </div>
                 """,
                     unsafe_allow_html=True,
@@ -9808,24 +10304,21 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                     st.caption("Série: nenhuma emissão própria disponível com os filtros atuais.")
                     st.session_state["v2_f_ser"] = []
                     filtro_series = []
-                _tem_serie = bool(st.session_state.get("v2_f_ser"))
-                if _tem_serie:
-                    st.selectbox(
-                        "Faixa do n.º da nota (requer série acima)",
-                        _V2_FAIXA_MODELO_LABELS,
-                        key="v2_f_faixa_modo",
-                    )
-                    _fm_ui = st.session_state.get("v2_f_faixa_modo", "Qualquer")
-                    if _fm_ui == "Entre":
-                        _fc1, _fc2 = st.columns(2)
-                        with _fc1:
-                            st.number_input("N.º >= / início", min_value=0, step=1, key="v2_f_faixa_n1")
-                        with _fc2:
-                            st.number_input("N.º <= / fim", min_value=0, step=1, key="v2_f_faixa_n2")
-                    elif _fm_ui != "Qualquer":
-                        st.number_input("N.º da nota", min_value=0, step=1, key="v2_f_faixa_n1")
-                else:
-                    st.caption("Escolha **série(s)** para ativar filtro por faixa do número da nota.")
+                st.selectbox(
+                    "Faixa do n.º da nota",
+                    _V2_FAIXA_MODELO_LABELS,
+                    key="v2_f_faixa_modo",
+                    help="Série vazia (=todas): a faixa aplica-se a toda a emissão própria já filtrada acima. Com série(s) escolhida(s), cruza com essas séries.",
+                )
+                _fm_ui = st.session_state.get("v2_f_faixa_modo", "Qualquer")
+                if _fm_ui == "Entre":
+                    _fc1, _fc2 = st.columns(2)
+                    with _fc1:
+                        st.number_input("N.º >= / início", min_value=0, step=1, key="v2_f_faixa_n1")
+                    with _fc2:
+                        st.number_input("N.º <= / fim", min_value=0, step=1, key="v2_f_faixa_n2")
+                elif _fm_ui != "Qualquer":
+                    st.number_input("N.º da nota", min_value=0, step=1, key="v2_f_faixa_n1")
 
                 if ufs_opts:
                     filtro_ufs = st.multiselect(
@@ -9999,10 +10492,7 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
             and len(filtro_operacao) == 0
             and len(filtro_ufs) == 0
             and (st.session_state.get("v2_f_data_modo") or "Qualquer") == "Qualquer"
-            and (
-                not st.session_state.get("v2_f_ser")
-                or (st.session_state.get("v2_f_faixa_modo") or "Qualquer") == "Qualquer"
-            )
+            and (st.session_state.get("v2_f_faixa_modo") or "Qualquer") == "Qualquer"
             and not _nota_esp_ativa
             and len(st.session_state.get("v2_t_stat") or []) == 0
             and len(st.session_state.get("v2_t_tip") or []) == 0
@@ -10601,12 +11091,14 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
 
 
     def _garim_etapa3_contabilidade_corpo(cnpj_limpo):
-        """Pacote contabilidade (Mariana) — imediatamente abaixo do expander ZIP/Excel (mesmo fragmento)."""
+        """Pacote de extração — dentro do expander «Pacote de extração» (fragmento Etapa 3)."""
         df_g_base = st.session_state["df_geral"]
         if st.session_state.get("mariana_export_ready"):
             _sig_mar = v2_assinatura_pacote_matriz_sessao(df_g_base)
             if st.session_state.get("mariana_export_sig") != _sig_mar:
                 st.session_state.pop("mariana_zip_parts", None)
+                st.session_state.pop("mariana_autent_pastas", None)
+                st.session_state.pop("mariana_pacote_modo", None)
                 st.session_state["mariana_export_ready"] = False
                 st.session_state.pop("mariana_export_sig", None)
                 st.session_state.pop("mariana_sem_xml_msg", None)
@@ -10614,23 +11106,77 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
 
         _pacote_matriz_btn_dis = df_g_base.empty
         _btn_pc = _is_mariana_pc_bundle()
+        _permite_caminho_pasta = not _streamlit_likely_community_cloud()
 
-        st.markdown(
-            f'<p style="margin:0.5rem 0 0.35rem 0;font-weight:700;color:#5D1B36;">'
-            f'{_garim_emoji("\U0001f4be")} Pacote contabilidade</p>',
-            unsafe_allow_html=True,
+        _modos_pacote = (
+            PACOTE_EXTRACAO_MODO_MATRIZ,
+            PACOTE_EXTRACAO_MODO_DOMINIO_ZIP,
+            PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA,
         )
-        if _btn_pc:
+        _modos_pacote_labels = {
+            PACOTE_EXTRACAO_MODO_MATRIZ: "Modelo ZIP (detalhado)",
+            PACOTE_EXTRACAO_MODO_DOMINIO_ZIP: "Modelo ZIP (simplificado)",
+            PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA: "Modelo Pasta aberta",
+        }
+        _submods_pasta_labels = {
+            PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO: "Pasta aberta (padrão do Domínio)",
+            PACOTE_EXTRACAO_SUBMOD_PASTA_AUTENTICIDADE: "Submódulo Autenticidade (NFe/CTe, lote 5.000)",
+        }
+        if "mariana_pacote_modo_sel" not in st.session_state:
+            st.session_state["mariana_pacote_modo_sel"] = PACOTE_EXTRACAO_MODO_MATRIZ
+        m_sel = str(st.session_state.get("mariana_pacote_modo_sel") or PACOTE_EXTRACAO_MODO_MATRIZ)
+        if m_sel not in _modos_pacote:
+            m_sel = PACOTE_EXTRACAO_MODO_MATRIZ
+            st.session_state["mariana_pacote_modo_sel"] = m_sel
+        if "mariana_pasta_aberta_submodo" not in st.session_state:
+            st.session_state["mariana_pasta_aberta_submodo"] = PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO
+        sub_pasta = str(
+            st.session_state.get("mariana_pasta_aberta_submodo")
+            or PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO
+        )
+        if sub_pasta not in _submods_pasta_labels:
+            sub_pasta = PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO
+            st.session_state["mariana_pasta_aberta_submodo"] = sub_pasta
+        st.caption(f"Modelo selecionado no passo inicial: **{_modos_pacote_labels.get(m_sel, m_sel)}**")
+        if m_sel == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA:
+            st.selectbox(
+                "Submódulo da pasta aberta",
+                options=tuple(_submods_pasta_labels.keys()),
+                key="mariana_pasta_aberta_submodo",
+                format_func=lambda k: _submods_pasta_labels.get(k, str(k)),
+                help="Autenticidade cria pastas só NFe/CTe em lotes de 5.000, sem ZIP.",
+            )
+        _bloq_autent_sem_pc = (
+            m_sel == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA
+            and (not _btn_pc or not _permite_caminho_pasta)
+        )
+        if _bloq_autent_sem_pc:
+            st.warning(
+                "**Autenticidade** grava pastas no disco e não gera ZIP. Aqui não está disponível o campo de **pasta completa** "
+                "(ex.: Cloud) — use outro modelo ou um ambiente com pasta no PC."
+            )
+        st.caption(
+            "Todo o lote lido, **sem** filtros da zona «Filtros e exportação». Domínio / Autenticidade: status **Autorizadas**, "
+            "**Canceladas** e **Inutilizadas**; terceiros só **NF-e**, **CT-e** e **CT-e OS**; emissão própria por **mês e série**."
+        )
+        if (
+            m_sel == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA
+            and str(st.session_state.get("mariana_pasta_aberta_submodo"))
+            == PACOTE_EXTRACAO_SUBMOD_PASTA_AUTENTICIDADE
+        ):
             st.caption(
-                "Modelo de extração pré definido, envio de dados para contabilidade matriz"
+                "Submódulo Autenticidade ativo: separa apenas por modelo **NFe/CTe** em pastas de até **5.000 XML**."
             )
 
         if "mariana_zip_save_dir" not in st.session_state:
             st.session_state["mariana_zip_save_dir"] = ""
         if "mariana_zip_basename" not in st.session_state:
             st.session_state["mariana_zip_basename"] = ""
+        if "mariana_usar_pasta_destino" not in st.session_state:
+            st.session_state["mariana_usar_pasta_destino"] = False
 
-        if _btn_pc:
+        _usar_pasta = bool(st.session_state.get("mariana_usar_pasta_destino"))
+        if _btn_pc and _permite_caminho_pasta and _usar_pasta:
             st.markdown("##### Pasta no PC — Excel + ZIPs")
             st.caption(
                 "Se definiu pasta no **passo 3**, o caminho aparece aqui e pode ser alterado. "
@@ -10650,14 +11196,20 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
         )
 
         _path_ok_pc = bool(str(st.session_state.get("mariana_zip_save_dir") or "").strip())
-        _btn_dis = _pacote_matriz_btn_dis or (_btn_pc and not _path_ok_pc)
+        _btn_dis = (
+            _pacote_matriz_btn_dis
+            or ((_btn_pc and _permite_caminho_pasta and _usar_pasta) and not _path_ok_pc)
+            or _bloq_autent_sem_pc
+        )
         if _pacote_matriz_btn_dis:
             st.warning("Relatório geral vazio — conclua o **garimpo** antes de gerar o pacote.")
-        elif _btn_pc and not _path_ok_pc:
+        elif (_btn_pc and _permite_caminho_pasta and _usar_pasta) and not _path_ok_pc:
             st.caption("Preencha a **pasta completa** acima para gravar no disco.")
 
         _lbl_gerar = (
-            "Gravar pacote na pasta indicada" if _btn_pc else "Gerar pacote para descarregar"
+            "Gravar pacote na pasta indicada"
+            if (_btn_pc and _permite_caminho_pasta and _usar_pasta)
+            else "Gerar pacote para descarregar"
         )
         gen_pacote_matriz = st.button(
             _lbl_gerar,
@@ -10671,8 +11223,13 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
             else:
                 _pacote_matriz_rerun = False
                 try:
-                    with st.spinner("A gerar pacote ZIP…"):
-                        if _btn_pc:
+                    _spin_lbl = (
+                        "A gravar pastas (autenticidade)…"
+                        if m_sel == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA
+                        else "A gerar pacote ZIP…"
+                    )
+                    with st.spinner(_spin_lbl):
+                        if _btn_pc and _permite_caminho_pasta and _usar_pasta:
                             _out_m, _err_m = _mariana_destino_zip_para_gravar()
                         else:
                             _out_m, _err_m = _mariana_destino_temp_para_descarga()
@@ -10680,15 +11237,22 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                             st.error(_err_m)
                         else:
                             st.session_state.pop("mariana_zip_parts", None)
+                            st.session_state.pop("mariana_autent_pastas", None)
+                            st.session_state.pop("mariana_pacote_modo", None)
                             st.session_state.pop("mariana_excel_completo_path", None)
                             _mar_bn = str(
                                 st.session_state.get("mariana_zip_basename") or ""
                             ).strip()
-                            parts_m, _xm_m, av_m, excel_m = _v2_export_zip_mariana(
+                            parts_m, _xm_m, av_m, excel_m = _v2_export_pacote_extracao(
                                 df_g_base,
                                 cnpj_limpo,
                                 zip_output_dir=_out_m,
                                 zip_file_stem=_mar_bn if _mar_bn else None,
+                                modo=m_sel,
+                                submodo_pasta_aberta=str(
+                                    st.session_state.get("mariana_pasta_aberta_submodo")
+                                    or PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO
+                                ),
                             )
                             if av_m and str(av_m).startswith("ERR:"):
                                 st.warning(str(av_m)[4:].strip())
@@ -10696,14 +11260,30 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                                 st.session_state.pop("mariana_export_sig", None)
                                 st.session_state.pop("mariana_sem_xml_msg", None)
                                 st.session_state.pop("mariana_excel_completo_path", None)
+                                st.session_state.pop("mariana_autent_pastas", None)
+                                st.session_state.pop("mariana_pacote_modo", None)
                             elif not parts_m and not excel_m:
                                 st.warning(av_m or "Nada a exportar.")
                                 st.session_state["mariana_export_ready"] = False
                                 st.session_state.pop("mariana_export_sig", None)
                                 st.session_state.pop("mariana_sem_xml_msg", None)
                                 st.session_state.pop("mariana_excel_completo_path", None)
+                                st.session_state.pop("mariana_autent_pastas", None)
+                                st.session_state.pop("mariana_pacote_modo", None)
                             else:
-                                st.session_state["mariana_zip_parts"] = parts_m or []
+                                st.session_state["mariana_pacote_modo"] = m_sel
+                                if m_sel == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA:
+                                    st.session_state["mariana_autent_pastas"] = list(
+                                        parts_m or []
+                                    )
+                                    st.session_state["mariana_zip_parts"] = []
+                                else:
+                                    st.session_state.pop(
+                                        "mariana_autent_pastas", None
+                                    )
+                                    st.session_state["mariana_zip_parts"] = (
+                                        parts_m or []
+                                    )
                                 if excel_m:
                                     st.session_state["mariana_excel_completo_path"] = (
                                         excel_m
@@ -10736,6 +11316,8 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                     st.session_state.pop("mariana_export_sig", None)
                     st.session_state.pop("mariana_sem_xml_msg", None)
                     st.session_state.pop("mariana_excel_completo_path", None)
+                    st.session_state.pop("mariana_autent_pastas", None)
+                    st.session_state.pop("mariana_pacote_modo", None)
                 if _pacote_matriz_rerun:
                     st.rerun()
         if st.session_state.get("mariana_export_ready"):
@@ -10747,7 +11329,7 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                 with open(_mxp, "rb") as _xfe:
                     _lbl_excel_mar = (
                         "Excel completo (sem Painel Fiscal) — mesmo ficheiro da pasta"
-                        if _btn_pc
+                        if (_btn_pc and _permite_caminho_pasta and _usar_pasta)
                         else "Excel completo (sem Painel Fiscal)"
                     )
                     st.download_button(
@@ -10757,29 +11339,49 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                         key="v2_dl_mariana_excel_completo",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
-            st.markdown("**Descarregar pacote (ZIP)**")
-            for _i_m, part_m in enumerate(
-                st.session_state.get("mariana_zip_parts") or []
-            ):
-                if os.path.exists(part_m):
-                    with open(part_m, "rb") as fm:
-                        st.download_button(
-                            f"Contabilidade · {rotulo_download_zip_parte(part_m)}",
-                            fm.read(),
-                            file_name=os.path.basename(part_m),
-                            key=f"v2_dl_mariana_{_i_m}",
-                        )
+            _modo_ok = str(
+                st.session_state.get("mariana_pacote_modo")
+                or PACOTE_EXTRACAO_MODO_MATRIZ
+            )
+            if _modo_ok == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA:
+                st.success(
+                    "Pacote **Autenticidade** gravado em pastas no disco (sem ficheiros ZIP)."
+                )
+                for _p_aut in st.session_state.get("mariana_autent_pastas") or []:
+                    st.caption(f"Pasta: `{_p_aut}`")
+            else:
+                st.markdown("**Descarregar pacote (ZIP)**")
+                _prefix_dl = (
+                    "Domínio"
+                    if _modo_ok == PACOTE_EXTRACAO_MODO_DOMINIO_ZIP
+                    else "Contabilidade"
+                )
+                for _i_m, part_m in enumerate(
+                    st.session_state.get("mariana_zip_parts") or []
+                ):
+                    if os.path.exists(part_m):
+                        with open(part_m, "rb") as fm:
+                            st.download_button(
+                                f"{_prefix_dl} · {rotulo_download_zip_parte(part_m)}",
+                                fm.read(),
+                                file_name=os.path.basename(part_m),
+                                key=f"v2_dl_mariana_{_i_m}",
+                            )
 
 
     def _garim_etapa3_fragment_entry():
-        """Expander «Filtros e exportação» + bloco contabilidade no mesmo fragmento (rerun parcial coerente)."""
+        """Expanders «Filtros e exportação» e «Pacote de extração» no mesmo fragmento."""
         _cx = "".join(c for c in str(st.session_state.get("cnpj_widget", "")) if c.isdigit())[:14]
         with st.expander(
             "\U0001f4e6 Filtros e exportação (ZIP / Excel)",
             expanded=False,
         ):
             _garim_etapa3_corpo(_cx)
-        _garim_etapa3_contabilidade_corpo(_cx)
+        with st.expander(
+            f'{_garim_emoji("\U0001f4be")} Pacote de extração',
+            expanded=False,
+        ):
+            _garim_etapa3_contabilidade_corpo(_cx)
 
 
     if st.session_state.get("confirmado"):
@@ -10930,17 +11532,68 @@ if (__name__ == "__main__") and (not os.environ.get("GARIMPEIRO_HEADLESS")):
                 st.session_state["mariana_zip_save_dir"] = ""
             if "mariana_zip_basename" not in st.session_state:
                 st.session_state["mariana_zip_basename"] = ""
+            if "mariana_usar_pasta_destino" not in st.session_state:
+                st.session_state["mariana_usar_pasta_destino"] = False
+            if "mariana_pacote_modo_sel" not in st.session_state:
+                st.session_state["mariana_pacote_modo_sel"] = PACOTE_EXTRACAO_MODO_MATRIZ
+            if "mariana_pasta_aberta_submodo" not in st.session_state:
+                st.session_state["mariana_pasta_aberta_submodo"] = PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO
             if not _streamlit_likely_community_cloud():
+                _modos_pacote = (
+                    PACOTE_EXTRACAO_MODO_MATRIZ,
+                    PACOTE_EXTRACAO_MODO_DOMINIO_ZIP,
+                    PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA,
+                )
+                _modos_pacote_labels = {
+                    PACOTE_EXTRACAO_MODO_MATRIZ: "Modelo ZIP (detalhado)",
+                    PACOTE_EXTRACAO_MODO_DOMINIO_ZIP: "Modelo ZIP (simplificado)",
+                    PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA: "Modelo Pasta aberta",
+                }
                 _extracao_lote_expander_md = """
-O que esperar de cada modelo:
+### Modelo ZIP (detalhado)
+- Gera **vários ZIPs separados** (lado a lado na pasta).  
+- **Não existe ZIP dentro de ZIP**.
+- Em cada ZIP: XML **soltos na raiz** (sem pastas internas) e o Excel do pacote.
+- É o modelo mais detalhado (mais organizado para conferência).
+- Exemplo de saída:
+  - `ClienteABC_EP_2026_01_Serie_1_Entrada_Autorizadas_NFe_notas_1_10000.zip`
+  - `ClienteABC_EP_2026_01_Serie_1_Entrada_Autorizadas_NFe_notas_10001_20000.zip`
+  - `ClienteABC_T_2026_01_Canceladas_CTe_notas_501_1200.zip`
 
-| | Arquivo (o normal) | Simplificado |
-|:---|:---|:---|
-| Gera relatório de garimpo? | Sim | Sim |
-| Ao abrir a pasta, os XML ficam logo à vista, sem abrir pastas | Não | Sim |
-| Padrão arquivo (Pastas e Subpastas) | Sim | Não |
-| Padrão Simplificado (Pasta única) | Não | Sim |
-| Parte o lote em mais de um ZIP se for muito grande | Sim — até 10 000 XML em cada ZIP | Sim — até 10 000 XML em cada ZIP |
+### Modelo ZIP (simplificado)
+- Gera **ZIP** com os XML já na **raiz** (sem pastas internas de XML).
+- Status usados: **Autorizadas**, **Canceladas** e **Inutilizadas**.
+- Terceiros: só **NFe** e **CTe**.
+- Emissão própria: por **mês + série + status**.
+- Limite: até **10.000 XML por ZIP**.
+- Exemplo de saída:
+  - `ClienteABC_DOM_EP_2026_01_Serie_1_Autorizadas_notas_1_10000.zip`
+  - `ClienteABC_DOM_EP_2026_01_Serie_1_Autorizadas_notas_10001_20000.zip`
+  - `ClienteABC_DOM_T_2026_01_Canceladas_CTe_notas_200_900.zip`
+- Dentro de cada ZIP os ficheiros já aparecem assim: `NFe3526....xml`, `CTe3126....xml` (direto na raiz).
+
+### Modelo Pasta aberta
+- Mesma regra do modelo Domínio, mas **sem ZIP**.
+- Em vez de ZIP, grava **pastas abertas** no disco.
+- Limite: até **10.000 XML por pasta/parte**.
+- Submódulo opcional **Autenticidade**:
+  - separa só por **modelo NFe e CTe**;
+  - não separa por status (o sistema externo consulta status depois);
+  - cria lotes de até **5.000 XML por pasta**.
+- Exemplo de saída:
+  - `ClienteABC__DOM_EP_2026_01_Serie_1_Autorizadas/`
+  - `ClienteABC__DOM_EP_2026_01_Serie_1_Autorizadas_pt02/`
+  - `ClienteABC__DOM_T_2026_01_Canceladas_CTe/`
+- Dentro dessas pastas: XML soltos (`NFe...xml`, `CTe...xml`) e Excel completo ao lado, na pasta base.
+
+### Regras gerais
+- O pacote considera **todos os XML lidos no garimpo**.
+- Os filtros que você marca na tabela da Etapa 3 **não reduzem** esse pacote.
+- Os dois modelos ZIP são **ZIP plano** (XML soltos); a diferença é o critério de agrupamento.
+- Resumo rápido:
+  - Quer mais organização para auditoria/conferência: **Modelo ZIP (detalhado)**.
+  - Quer ZIP mais direto para rotina: **Modelo ZIP (simplificado)**.
+  - Quer só estrutura em pastas (sem ZIP): **Modelo Pasta aberta**.
                 """.strip()
                 st.markdown(
                     f'<p style="margin:1rem 0 0.25rem 0;font-weight:700;color:#5D1B36;font-size:0.98rem;line-height:1.35;">'
@@ -10953,22 +11606,51 @@ O que esperar de cada modelo:
                 st.caption(
                     "Cole a pasta antes de Iniciar grande garimpo."
                 )
+                st.selectbox(
+                    "Modelo do pacote de extração",
+                    options=_modos_pacote,
+                    key="mariana_pacote_modo_sel",
+                    format_func=lambda m: _modos_pacote_labels.get(m, str(m)),
+                    help="Esta escolha será usada na secção «Pacote de extração» após o garimpo.",
+                )
+                if (
+                    str(st.session_state.get("mariana_pacote_modo_sel"))
+                    == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA
+                ):
+                    st.selectbox(
+                        "Submódulo da pasta aberta",
+                        options=(
+                            PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO,
+                            PACOTE_EXTRACAO_SUBMOD_PASTA_AUTENTICIDADE,
+                        ),
+                        key="mariana_pasta_aberta_submodo",
+                        format_func=lambda x: (
+                            "Pasta aberta (padrão do Domínio)"
+                            if x == PACOTE_EXTRACAO_SUBMOD_PASTA_PADRAO
+                            else "Submódulo Autenticidade (NFe/CTe, lote 5.000)"
+                        ),
+                        help="No submódulo Autenticidade, a pasta aberta fica por NFe/CTe e 5.000 XML por pasta.",
+                    )
+                st.checkbox(
+                    "Usar pasta local para gravar ficheiros no disco",
+                    key="mariana_usar_pasta_destino",
+                    help="Se desmarcado, não usa caminho local; os ficheiros ficam só para descarga.",
+                )
+                _usar_pasta_local = bool(st.session_state.get("mariana_usar_pasta_destino"))
+                if not _usar_pasta_local:
+                    st.session_state["mariana_zip_save_dir"] = ""
                 st.text_input(
                     "Pasta de destino",
                     key="mariana_zip_save_dir",
                     placeholder="Ex.: D:\\Contabilidade\\Apuracao — ou vazio para não gravar no disco",
                     help="Explorador: Shift+clique direito na pasta → copiar caminho. Dentro: `Garimpeiro_Local_…`. Pastas de XML no disco só nos modos **… aberto**; nos modos **… ZIP** ficam só `.zip` e Excel.",
+                    disabled=not _usar_pasta_local,
                 )
                 st.text_input(
                     "Prefixo opcional dos nomes dos ZIP (sem .zip)",
                     key="mariana_zip_basename",
                     placeholder="Opcional — ex.: Cliente ou projeto",
                     help="Prefixo sanitizado dos ficheiros .zip do pacote contabilidade.",
-                )
-                _h_layout = (
-                    "**Aberto** = pastas com XML no espelho **e** `.zip` do pacote. **ZIP** = só `.zip` e Excel (sem pastas de XML). "
-                    "**Arquivo** / **Simplificado** valem **para pastas e para dentro dos ZIP**. "
-                    "**Ler** o lote não muda. Detalhes: expander **Detalhes de cada Modelo de extração**."
                 )
                 try:
                     st.session_state.pop("garimpo_chk_apenas_zip", None)
@@ -10988,25 +11670,16 @@ O que esperar de cada modelo:
                         "dom_zip": "Simplificado ZIP",
                     }.get(str(c or ""), "Arquivo aberto")
 
-                _tem_pasta_destino = bool(str(st.session_state.get("mariana_zip_save_dir") or "").strip())
-                if _tem_pasta_destino:
-                    st.selectbox(
-                        "**Como gravar na pasta de rede**",
-                        options=tuple(x[0] for x in _garimpo_extracao_modo_quatro_codigos()),
-                        key=SESSION_KEY_GARIMPO_EXTRACAO_MODO_QUATRO,
-                        format_func=_fmt_modo_quatro,
-                        help=_h_layout,
-                    )
-                    _garimpo_extracao_aplicar_modo_quatro(
-                        str(st.session_state.get(SESSION_KEY_GARIMPO_EXTRACAO_MODO_QUATRO) or "rec_aberto")
-                    )
-                    st.caption(
-                        "Resumo em tabela (Arquivo vs Simplificado; pastas **e** ZIP): expander **Detalhes de cada Modelo de extração**."
-                    )
+                _m_pkg_sel = str(
+                    st.session_state.get("mariana_pacote_modo_sel")
+                    or PACOTE_EXTRACAO_MODO_MATRIZ
+                )
+                if _m_pkg_sel == PACOTE_EXTRACAO_MODO_AUTENTICIDADE_PASTA:
+                    # Pasta aberta: espelho em pastas no disco.
+                    _garimpo_extracao_aplicar_modo_quatro("dom_aberto")
                 else:
-                    st.caption(
-                        "Modelo de gravação: **decidir depois**. Defina a pasta acima para liberar essa escolha."
-                    )
+                    # Modelos ZIP: só ZIP no disco (sem pastas abertas do espelho).
+                    _garimpo_extracao_aplicar_modo_quatro("dom_zip")
                 with st.expander("Detalhes de cada Modelo de extração", expanded=False):
                     st.markdown(_extracao_lote_expander_md)
             # Community Cloud: PASSO 3 oculto; ZIP e pastas ficam em «matriosca» (definição acima se a chave ainda não existir).
@@ -11014,6 +11687,7 @@ O que esperar de cada modelo:
                 _ui_scroll_to_top()
                 # No mesmo rerun do clique o file_uploader por vezes devolve vazio — usar session_state (igual ao «Processar Dados»).
                 _ufs = uploaded_files
+                _ufs_from_widget = bool(_ufs)
                 if _ufs is not None and not isinstance(_ufs, (list, tuple)):
                     _ufs = [_ufs]
                 _ufs = list(_ufs) if _ufs else []
@@ -11027,6 +11701,13 @@ O que esperar de cada modelo:
                 _usar_pasta_servidor = bool(
                     _dir_fonte_raw and _garimpo_mostrar_campo_pasta_lote_entrada()
                 )
+                if _usar_pasta_servidor and _ufs:
+                    if _ufs_from_widget:
+                        # Upload novo no clique atual tem prioridade sobre pasta.
+                        _usar_pasta_servidor = False
+                    else:
+                        # Pasta informada tem prioridade sobre uploads antigos da sessão.
+                        _ufs = []
 
                 if not _ufs and not _usar_pasta_servidor:
                     st.error(
@@ -11041,14 +11722,95 @@ O que esperar de cada modelo:
                     st.session_state.pop("_garimpo_zero_docs_msg", None)
                     _t_garim = time.time()
                     footer_bar = st.empty()
-                    _garim_footer_render(
-                        footer_bar,
-                        0,
-                        1,
-                        "—",
-                        "A preparar…",
-                        _t_garim,
+                    log_box = st.container(border=True)
+                    log_title = log_box.empty()
+                    log_view = log_box.empty()
+                    _garim_logs: list[str] = []
+                    _garim_etapas = [
+                        "Preparar ambiente",
+                        "Carregar lote (upload/pasta)",
+                        "Ler XML/ZIP e identificar documentos",
+                        "Montar tabelas e resumo",
+                        "Finalizar e liberar relatório",
+                    ]
+                    _garim_state = {"etapa_idx": 0}
+
+                    def _garim_log(msg: str):
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        _garim_logs.append(f"{ts} · {msg}")
+                        if len(_garim_logs) > 18:
+                            del _garim_logs[0]
+                        _garim_render_painel()
+
+                    def _garim_eta_txt(cur: int, total: int, t_start):
+                        try:
+                            c = int(cur or 0)
+                            t = max(1, int(total or 1))
+                            if c <= 0 or t_start is None:
+                                return "a calcular…"
+                            elapsed = max(0.0, time.time() - float(t_start))
+                            if c < 3 or elapsed < 2.0:
+                                return "a calcular…"
+                            rem = (elapsed / float(c)) * max(0, t - c)
+                            return _garim_footer_elapsed_txt(time.time() - rem)
+                        except Exception:
+                            return "a calcular…"
+
+                    def _garim_etapas_md(idx_atual: int) -> str:
+                        rows = []
+                        for i, nome in enumerate(_garim_etapas):
+                            if i < idx_atual:
+                                rows.append(f"- ✅ {nome}")
+                            elif i == idx_atual:
+                                rows.append(f"- 🔄 {nome}")
+                            else:
+                                rows.append(f"- ⏳ {nome}")
+                        return "\n".join(rows)
+
+                    def _garim_render_painel(
+                        cur: int = 0,
+                        total: int = 1,
+                        etapa_atual: int | None = None,
+                        prox_msg: str = "",
+                    ):
+                        if etapa_atual is not None:
+                            _garim_state["etapa_idx"] = max(0, min(int(etapa_atual), len(_garim_etapas) - 1))
+                        pct = int((max(0, cur) / max(1, total)) * 100)
+                        eta = _garim_eta_txt(cur, total, _t_garim)
+                        log_title.markdown(
+                            f"**Status da leitura (tempo real)** · Progresso: **{cur}/{total}** (**{pct}%**) · ETA: **{eta}**"
+                        )
+                        corpo = (
+                            "### Etapas\n"
+                            f"{_garim_etapas_md(_garim_state['etapa_idx'])}\n\n"
+                            "### Log\n"
+                            + ("\n".join([f"- {x}" for x in _garim_logs]) if _garim_logs else "- aguardando…")
+                        )
+                        if prox_msg:
+                            corpo += f"\n\n### Próximo passo\n- {prox_msg}"
+                        log_view.markdown(corpo)
+                    def _garim_overlay(cur, total, arquivo, fase, prox_msg=""):
+                        _garim_footer_render(
+                            footer_bar,
+                            cur,
+                            total,
+                            arquivo,
+                            fase,
+                            _t_garim,
+                            proximo=prox_msg,
+                            eventos=_garim_logs[-4:],
+                            etapas=_garim_etapas,
+                            etapa_idx=_garim_state["etapa_idx"],
+                        )
+
+                    _garim_log("Início do processo. A preparar ambiente de leitura.")
+                    _garim_render_painel(
+                        cur=0,
+                        total=1,
+                        etapa_atual=0,
+                        prox_msg="Validar destino de gravação e preparar temporários.",
                     )
+                    _garim_overlay(0, 1, "—", "A preparar ambiente de leitura", "Validar destino e preparar temporários.")
                     if hasattr(st, "toast"):
                         try:
                             st.toast(
@@ -11058,6 +11820,13 @@ O que esperar de cada modelo:
                         except Exception:
                             pass
                     _esp_base, _esp_err = _garimpo_destino_copia_lote_opcional()
+                    _garim_log("Validando destino de gravação (opcional) e pastas temporárias.")
+                    _garim_render_painel(
+                        cur=1,
+                        total=5,
+                        etapa_atual=0,
+                        prox_msg="Carregar lote por upload ou por pasta.",
+                    )
                     st.session_state.pop("garimpo_lote_espelho_root", None)
                     st.session_state.pop("garimpo_espelho_indice_td", None)
                     st.session_state.pop("garimpo_lote_save_resolved", None)
@@ -11075,10 +11844,12 @@ O que esperar de cada modelo:
                             _root.mkdir(parents=True, exist_ok=True)
                             st.session_state["garimpo_lote_espelho_root"] = str(_root)
                             st.session_state["garimpo_lote_save_resolved"] = str(_esp_base)
+                            _garim_log(f"Espelho local preparado em `{_root}`.")
                         except OSError as e:
                             st.error(f"Não foi possível preparar a pasta de espelho: {e}")
                             st.stop()
                     limpar_arquivos_temp()
+                    _garim_log("Temporários limpos. Preparando lote para leitura.")
                     _mem_lote = {}
                     if not _garimpo_analise_sem_pasta_local_projeto():
                         os.makedirs(TEMP_UPLOADS_DIR, exist_ok=True)
@@ -11109,18 +11880,35 @@ O que esperar de cada modelo:
                                 "**Nenhum .xml ou .zip** nessa pasta (recursivo). Confirme o caminho ou anexe ficheiros."
                             )
                             st.stop()
+                        _garim_log(
+                            f"Lote carregado da pasta do servidor: `{_pasta_lote_path}` ({_n_pasta_lote} arquivo(s))."
+                        )
+                    elif _ufs:
+                        _garim_log(f"Lote recebido por upload: {len(_ufs)} arquivo(s).")
+                    _garim_render_painel(
+                        cur=2,
+                        total=5,
+                        etapa_atual=1,
+                        prox_msg="Ler XML/ZIP e identificar documentos do lote.",
+                    )
 
                     lote_dict = {}
                     progresso_bar = st.progress(0)
                     status_text = st.empty()
                     total_arquivos = len(_ufs) if _ufs else max(1, _n_pasta_lote)
-                    _garim_footer_render(
-                        footer_bar,
+                    _garim_log(f"Iniciando leitura: {total_arquivos} arquivo(s) na fila.")
+                    _garim_render_painel(
+                        cur=0,
+                        total=max(1, total_arquivos),
+                        etapa_atual=2,
+                        prox_msg="Processar XML e consolidar documentos únicos.",
+                    )
+                    _garim_overlay(
                         0,
                         max(1, total_arquivos),
                         "—",
-                        "Preparar",
-                        _t_garim,
+                        "A preparar fila de arquivos",
+                        "Copiar arquivos e iniciar leitura XML/ZIP.",
                     )
 
                     _lbl_status = (
@@ -11131,14 +11919,14 @@ O que esperar de cada modelo:
                     with st.status(_lbl_status, expanded=True) as status_box:
 
                         if _ufs:
+                            _garim_log("Copiando uploads para área de leitura.")
                             for i, f in enumerate(_ufs):
-                                _garim_footer_render(
-                                    footer_bar,
+                                _garim_overlay(
                                     i + 1,
                                     total_arquivos,
                                     getattr(f, "name", None) or f"ficheiro_{i}",
-                                    "Guardar",
-                                    _t_garim,
+                                    "Copiando arquivo para leitura",
+                                    "Após cópia: ler XML/ZIP e identificar documentos.",
                                 )
                                 raw = f.getvalue()
                                 key = _garimpo_nome_chave_upload(i, getattr(f, "name", None))
@@ -11149,15 +11937,16 @@ O que esperar de cada modelo:
                                     with open(caminho_salvo, "wb") as out_f:
                                         out_f.write(raw)
                             _garimpo_descarta_upload_lote_xml_apos_copia()
+                            _garim_log("Uploads copiados com sucesso.")
                         elif _n_pasta_lote:
-                            _garim_footer_render(
-                                footer_bar,
+                            _garim_overlay(
                                 1,
                                 max(1, total_arquivos),
                                 str(_pasta_lote_path or "pasta"),
-                                "Pasta",
-                                _t_garim,
+                                "Lendo lista de arquivos da pasta",
+                                "Depois: processar XML/ZIP e consolidar documentos.",
                             )
+                            _garim_log("Arquivos da pasta do servidor preparados para leitura.")
 
                         if _garimpo_analise_sem_pasta_local_projeto() and _mem_lote:
                             try:
@@ -11170,6 +11959,7 @@ O que esperar de cada modelo:
 
                         lista_salvos = _lista_nomes_fontes_xml_garimpo()
                         total_salvos = len(lista_salvos)
+                        _garim_log(f"Lendo conteúdo XML/ZIP: {total_salvos} arquivo(s) no lote.")
                         if _garimpo_escrita_espelho_final_continua_ativa():
                             _garimpo_hidratar_sped_sessao_do_widget_ini()
 
@@ -11183,15 +11973,21 @@ O que esperar de cada modelo:
                                 if len(str(f_name)) > 58
                                 else str(f_name)
                             )
-                            status_text.text(f"\u26cf\ufe0f {_fn_disp}")
-                            _garim_footer_render(
-                                footer_bar,
+                            status_text.text(f"\u26cf\ufe0f Lendo arquivo: {_fn_disp}")
+                            _garim_overlay(
                                 i + 1,
                                 total_salvos,
                                 f_name,
-                                "Extrair",
-                                _t_garim,
+                                "Lendo XML e identificando documentos",
+                                "Depois da leitura: montar tabelas e relatório final.",
                             )
+                            if i % 10 == 0:
+                                _garim_render_painel(
+                                    cur=i + 1,
+                                    total=max(1, total_salvos),
+                                    etapa_atual=2,
+                                    prox_msg="Depois da leitura: montar tabelas e gerar resumo final.",
+                                )
 
                             try:
                                 with _abrir_fonte_xml_garimpo_stream(f_name) as file_obj:
@@ -11205,15 +12001,18 @@ O que esperar de cada modelo:
                                         ):
                                             _nk_live = len(lote_dict)
                                             status_text.text(
-                                                f"\u26cf\ufe0f {_inner_xml_n} xml · {_nk_live} docs"
+                                                f"\u26cf\ufe0f XML lidos: {_inner_xml_n} · documentos únicos: {_nk_live}"
                                             )
-                                            _garim_footer_render(
-                                                footer_bar,
+                                            _garim_overlay(
                                                 i + 1,
                                                 total_salvos,
                                                 f_name,
-                                                f"{_inner_xml_n} xml · {_nk_live}",
-                                                _t_garim,
+                                                f"Processando arquivo · XML {_inner_xml_n} · Docs únicos {_nk_live}",
+                                                "Continuar leitura até fechar lote e montar tabelas.",
+                                            )
+                                        if _inner_xml_n == 1 and i % 25 == 0:
+                                            _garim_log(
+                                                f"Lendo `{f_name}`… documentos únicos até agora: {len(lote_dict)}."
                                             )
                                         res, is_p = identify_xml_info(xml_data, cnpj_limpo, name)
                                         if res:
@@ -11235,13 +12034,21 @@ O que esperar de cada modelo:
                         status_box.update(label="\u2705 Pronto", state="complete", expanded=False)
                         progresso_bar.empty()
                         status_text.empty()
-                        _garim_footer_render(
-                            footer_bar,
+                        _garim_overlay(
                             total_salvos,
                             max(1, total_salvos),
                             "—",
-                            "Resumo",
-                            _t_garim,
+                            "Montando relatório final",
+                            "Próximo passo: abrir relatório da leitura e exportações.",
+                        )
+                        _garim_log(
+                            f"Leitura concluída. Próximo passo: montar tabelas e relatório ({len(lote_dict)} documento(s) único(s))."
+                        )
+                        _garim_render_painel(
+                            cur=max(1, total_salvos),
+                            total=max(1, total_salvos),
+                            etapa_atual=3,
+                            prox_msg="Consolidar tabelas por status, buracos e relatório geral.",
                         )
 
                     rel_list = []
@@ -11280,7 +12087,6 @@ O que esperar de cada modelo:
                             "Ano": res["Ano"], 
                             "Mes": res["Mes"]
                         }
-
                         if res["Status"] == "INUTILIZADOS":
                             r = res.get("Range", (res["Número"], res["Número"]))
                             for n in range(r[0], r[1] + 1):
@@ -11354,6 +12160,13 @@ O que esperar de cada modelo:
                             pass
                         st.stop()
 
+                    _garim_log("Tabelas calculadas. Próximo passo: gravar estado da sessão e exibir relatório.")
+                    _garim_render_painel(
+                        cur=4,
+                        total=5,
+                        etapa_atual=4,
+                        prox_msg="Exibir relatório da leitura e liberar exportações.",
+                    )
                     res_final = []
                     fal_final = []
 
